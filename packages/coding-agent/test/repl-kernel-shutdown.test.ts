@@ -11,6 +11,7 @@ type ShutdownInternals = {
 	wireChild: (child: ShutdownInternals["child"]) => void;
 	pendingDoneWaiters: Map<string, () => void>;
 	inFlightHostRequests: Set<Promise<void>>;
+	kernelStderr: string;
 	child: EventEmitter & {
 		exitCode: number | null;
 		signalCode: NodeJS.Signals | null;
@@ -18,18 +19,27 @@ type ShutdownInternals = {
 		pid?: number;
 		stdin: { destroyed: boolean; destroy: () => void };
 		stdout?: { destroy: () => void; on: (event: string, listener: (...args: unknown[]) => void) => void };
-		stderr?: { destroy: () => void; on: (event: string, listener: (...args: unknown[]) => void) => void };
+		stderr?: {
+			destroy: () => void;
+			on: (event: string, listener: (...args: unknown[]) => void) => void;
+			once: (event: string, listener: (...args: unknown[]) => void) => void;
+		};
 	};
 };
 
 function configuredManager(
 	onSend: (request: Record<string, unknown>, internals: ShutdownInternals) => void | Promise<void>,
 	hostHandlers?: HostRequestHandlers,
+	withSnapshot = false,
 ): {
 	manager: ReplKernelManager;
 	internals: ShutdownInternals;
 } {
-	const manager = new ReplKernelManager({ cwd: process.cwd(), hostHandlers });
+	const manager = new ReplKernelManager({
+		cwd: process.cwd(),
+		hostHandlers,
+		snapshot: withSnapshot ? { path: "/tmp/shutdown-test.dill", manifestPath: "/tmp/shutdown-test.json" } : undefined,
+	});
 	const internals = manager as unknown as ShutdownInternals;
 	const child = Object.assign(new EventEmitter(), {
 		exitCode: null,
@@ -38,7 +48,7 @@ function configuredManager(
 		pid: undefined,
 		stdin: { destroyed: false, destroy: vi.fn() },
 		stdout: { destroy: vi.fn(), on: vi.fn() },
-		stderr: { destroy: vi.fn(), on: vi.fn() },
+		stderr: { destroy: vi.fn(), on: vi.fn(), once: vi.fn() },
 	});
 	Object.assign(internals, {
 		state: "running",
@@ -51,13 +61,21 @@ function configuredManager(
 }
 
 describe("ReplKernelManager graceful shutdown", () => {
-	it("bounds a stuck stdin write with the aggregate shutdown deadline", async () => {
+	it.each([
+		["optional policy", {}],
+		["snapshot-and-drain policy", { snapshot: true, drainHostRequests: true }],
+	] as const)("uses the same diagnostic deadline for the %s", async (_label, options) => {
 		vi.useFakeTimers();
 		try {
-			const { manager, internals } = configuredManager(() => new Promise<void>(() => {}));
-			const shutdown = manager.shutdown();
+			const { manager, internals } = configuredManager(() => new Promise<void>(() => {}), undefined, true);
+			// The final flush snapshots through the private captureSnapshot (bounded, prune-free).
+			vi.spyOn(manager as unknown as { captureSnapshot: () => Promise<null> }, "captureSnapshot").mockResolvedValue(
+				null,
+			);
+			const shutdown = manager.shutdown(options);
 			await vi.advanceTimersByTimeAsync(5_000);
-			await shutdown;
+			await expect(shutdown).resolves.toBe(true);
+			expect(internals.kernelStderr).toContain("Kernel did not shut down within 5000ms");
 			expect(internals.child).toBeUndefined();
 		} finally {
 			vi.useRealTimers();
@@ -104,33 +122,50 @@ describe("ReplKernelManager graceful shutdown", () => {
 		}
 	});
 
-	it("settles an in-flight host request before dispose tears the kernel down", async () => {
+	it("flushes a snapshot and drains host requests when session teardown selects both policies", async () => {
 		let releaseHandler: (() => void) | undefined;
 		const handlerBlocked = new Promise<void>((resolve) => {
 			releaseHandler = resolve;
 		});
 		const sentReplies: Record<string, unknown>[] = [];
 		const { manager, internals } = configuredManager(
-			async (request) => {
+			async (request, state) => {
 				if (request.type === "host_reply") sentReplies.push(request);
+				if (request.type === "shutdown") {
+					state.handleEvent({ event: "done", id: request.id, status: "ok" });
+					state.child.exitCode = 0;
+					state.child.emit("exit", 0, null);
+				}
 			},
 			{
 				"test.slow": async () => {
 					await handlerBlocked;
-					return { answer: 42 };
+					return { answer: 42, status: "weird" };
 				},
 			},
+			true,
 		);
+		const snapshot = vi
+			.spyOn(manager as unknown as { captureSnapshot: () => Promise<null> }, "captureSnapshot")
+			.mockResolvedValue(null);
 
 		internals.handleEvent({ event: "host_request", id: "hr-1", data: { type: "test.slow" } });
-		expect(internals.inFlightHostRequests.size).toBe(1);
+		const shutdown = manager.shutdown({ snapshot: true, drainHostRequests: true });
+		await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
 
-		const dispose = manager.dispose();
+		expect(snapshot).toHaveBeenCalledOnce();
+		expect(internals.writeLine).not.toHaveBeenCalled();
 		releaseHandler?.();
-		await dispose;
+		await shutdown;
 
 		expect(internals.inFlightHostRequests.size).toBe(0);
-		expect(sentReplies).toEqual([{ type: "host_reply", id: "hr-1", data: { status: "ok", answer: 42 } }]);
+		expect(sentReplies).toEqual([
+			{
+				type: "host_reply",
+				id: "hr-1",
+				data: { status: "ok", result: { answer: 42, status: "weird" } },
+			},
+		]);
 		expect(internals.child).toBeUndefined();
 	});
 
@@ -152,19 +187,64 @@ describe("ReplKernelManager graceful shutdown", () => {
 					return { answer: 42 };
 				},
 			},
+			true,
 		);
+		const snapshot = vi
+			.spyOn(manager as unknown as { captureSnapshot: () => Promise<null> }, "captureSnapshot")
+			.mockResolvedValue(null);
 
 		internals.handleEvent({ event: "host_request", id: "hr-1", data: { type: "test.slow" } });
 		const tracked = [...internals.inFlightHostRequests];
 		expect(tracked).toHaveLength(1);
 
 		await manager.shutdown();
+		expect(snapshot).not.toHaveBeenCalled();
 		expect(internals.child).toBeUndefined();
 
 		// The reply write fails against the torn-down child; the task must still settle.
 		releaseHandler?.();
 		await Promise.all(tracked);
 		expect(internals.inFlightHostRequests.size).toBe(0);
+	});
+
+	it("shares one wire exchange across concurrent graceful shutdown calls", async () => {
+		let exitKernel: (() => void) | undefined;
+		const { manager, internals } = configuredManager((request, state) => {
+			state.handleEvent({ event: "done", id: request.id, status: "ok" });
+			exitKernel = () => {
+				state.child.exitCode = 0;
+				state.child.emit("exit", 0, null);
+			};
+		});
+
+		const owner = manager.shutdown();
+		await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+		const concurrent = manager.shutdown();
+		exitKernel?.();
+
+		await expect(owner).resolves.toBe(true);
+		await expect(concurrent).resolves.toBe(false);
+		expect(internals.writeLine).toHaveBeenCalledOnce();
+	});
+
+	it("stands down when a hard teardown supersedes the snapshot flush", async () => {
+		let releaseSnapshot: (() => void) | undefined;
+		const snapshotBlocked = new Promise<null>((resolve) => {
+			releaseSnapshot = () => resolve(null);
+		});
+		const { manager, internals } = configuredManager(() => undefined, undefined, true);
+		vi.spyOn(manager as unknown as { captureSnapshot: () => Promise<null> }, "captureSnapshot").mockReturnValue(
+			snapshotBlocked,
+		);
+		const child = internals.child;
+
+		const shutdown = manager.shutdown({ snapshot: true });
+		await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+		await manager.kill();
+		releaseSnapshot?.();
+
+		await expect(shutdown).resolves.toBe(false);
+		expect(child.kill).toHaveBeenCalledOnce();
 	});
 
 	it("restart after a graceful shutdown starts the kernel again", async () => {
@@ -195,6 +275,23 @@ describe("ReplKernelManager graceful shutdown", () => {
 		await manager.restart();
 
 		expect(start).not.toHaveBeenCalled();
+	});
+
+	it("kill() destroys stderr only while the child has not exited", async () => {
+		// Alive child: it may ignore the signal and never emit 'exit', so the
+		// post-exit drain would never bound the pipe — teardown must.
+		const alive = configuredManager(() => {});
+		const aliveChild = alive.internals.child;
+		await alive.manager.kill();
+		expect(aliveChild.stderr?.destroy).toHaveBeenCalledTimes(1);
+
+		// Exited child: the post-exit drain owns the stream; destroying it in
+		// teardown would drop the kernel's buffered last words.
+		const exited = configuredManager(() => {});
+		const exitedChild = exited.internals.child;
+		exitedChild.exitCode = 42;
+		await exited.manager.kill();
+		expect(exitedChild.stderr?.destroy).not.toHaveBeenCalled();
 	});
 
 	it("waits for the matching shutdown done and removes its waiter", async () => {

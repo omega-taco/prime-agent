@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from types import FunctionType, SimpleNamespace
 from unittest import mock
 
 from rlm import bash
@@ -54,6 +55,38 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
         handle = bash("echo again")
         awaited = await handle
         self.assertEqual(handle.poll(), awaited)
+
+    def test_construction_cleanup_uses_windows_signal_without_sigkill(self):
+        failure = RuntimeError("task construction failed")
+        loop = mock.Mock()
+        loop.create_task.side_effect = failure
+        bridge = SimpleNamespace(emit=mock.Mock())
+        namespace = dict(bash_module.BashHandle._schedule_background_completion_notice.__globals__)
+
+        def isolated_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if level == 1 and name == "" and fromlist == ("repl",):
+                return SimpleNamespace(repl=bridge)
+            return __import__(name, globals, locals, fromlist, level)
+
+        namespace.update(
+            _IS_POSIX=False,
+            signal=SimpleNamespace(SIGTERM=15),
+            asyncio=SimpleNamespace(get_running_loop=lambda: loop),
+            __builtins__={**vars(__import__("builtins")), "__import__": isolated_import},
+        )
+        schedule = FunctionType(
+            bash_module.BashHandle._schedule_background_completion_notice.__code__, namespace
+        )
+        handle = mock.Mock(_pid=42)
+        with self.assertRaises(RuntimeError) as caught:
+            schedule(handle)
+        self.assertIs(caught.exception, failure)
+        handle.kill.assert_called_once_with(15)
+        handle._notify_background_completion.return_value.close.assert_called_once_with()
+        activity = bridge.emit.call_args_list[0].args[0]
+        mime = "application/vnd.prime-agent.bash-activity+json"
+        self.assertTrue(activity[mime]["active"])
+        bridge.emit.assert_called_with({mime: {**activity[mime], "active": False}})
 
     async def test_status_pipe_survives_high_fds_and_strict_posix_shell(self):
         # Regression: dash rejects multi-digit fds in redirections at parse
@@ -176,20 +209,20 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(records[-1]["active"])
             await _poll_group_dead(handle.pid)
 
-    async def test_delivered_status_wins_when_shell_dies_during_drain(self):
+    async def test_delivered_status_wins_when_shell_dies_during_completion(self):
         entered = threading.Event()
         release = threading.Event()
-        original = bash_module.BashHandle._drain_grace
+        original = bash_module.BashHandle._wait_for_completion
 
-        def held_drain(handle_self):
-            # Hold only the first caller (the reporter, which drains right after
-            # reading status 0); any later caller must proceed normally.
-            if not entered.is_set():
-                entered.set()
-                release.wait(10)
-            original(handle_self)
+        def held_completion(handle_self):
+            output = original(handle_self)
+            entered.set()
+            release.wait(10)
+            return output
 
-        with mock.patch.object(bash_module.BashHandle, "_drain_grace", held_drain):
+        with mock.patch.object(
+            bash_module.BashHandle, "_wait_for_completion", held_completion
+        ):
             # Background job keeps the shell alive in `wait` after status 0 is delivered.
             handle = bash("sleep 30 & true")
             try:
@@ -337,7 +370,7 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
             self.skipTest("POSIX-only gate")
         with tempfile.TemporaryDirectory() as tmp:
             marker = os.path.join(tmp, "ran")
-            script = bash_module._status_script(f"touch {marker}")
+            script = bash_module._status_script(f"touch {marker}", "a" * 32, "b" * 32)
             parent, child = socket.socketpair()
             proc = subprocess.Popen(
                 [bash_module._shell(), "-c", script],
@@ -539,26 +572,29 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
                     bash_module._shell()
                 which.assert_not_called()
 
-    async def test_pump_paused_between_read_and_commit_does_not_lose_output(self):
-        # Reviewer repro: the chunk is out of the pipe (FIONREAD 0) but not yet
-        # in the buffer; the drain fence must wait for the commit.
+    async def test_pump_delayed_past_old_quiescence_bound_captures_all_output(self):
+        # The ordered sentinel must wait through a pump delay beyond the old 500 ms bound.
         original_write = bash_module._BoundedBuffer.write
         delayed_once = threading.Event()
 
         def delayed_write(buffer_self, chunk):
             if not delayed_once.is_set():
                 delayed_once.set()
-                time.sleep(0.3)
+                time.sleep(0.7)
             original_write(buffer_self, chunk)
 
         with mock.patch.object(bash_module._BoundedBuffer, "write", delayed_write):
-            result = await asyncio.wait_for(bash("printf between-read-and-write"), timeout=5)
+            result = await asyncio.wait_for(bash("printf delayed-output-complete"), timeout=5)
         self.assertEqual(result.exit_code, 0)
-        self.assertIn("between-read-and-write", result.output)
+        self.assertEqual(result.output, "delayed-output-complete")
+
+    async def test_completion_marker_split_across_reads_is_removed(self):
+        with mock.patch.object(bash_module, "_READ_CHUNK", 7):
+            result = await asyncio.wait_for(bash("printf exact-pre-fence-output"), timeout=5)
+        self.assertEqual(result.output, "exact-pre-fence-output")
 
     async def test_slow_pump_does_not_lose_foreground_output(self):
-        # A descheduled pump must not let _drain_grace conclude quiescence
-        # while the shell's output still sits unread in the pipe.
+        # Finalization waits for the pump to parse the ordered sentinel.
         original_pump = bash_module.BashHandle._pump
 
         def slow_pump(handle_self):
@@ -569,6 +605,58 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
             result = await asyncio.wait_for(bash("printf slow-pump-x"), timeout=5)
         self.assertEqual(result.exit_code, 0)
         self.assertIn("slow-pump-x", result.output)
+
+    async def test_sentinel_like_output_and_echoed_wrapper_do_not_truncate(self):
+        token = "0123456789abcdef" * 4
+        raw_lookalike = "\x1eprime-agent-complete:not-this-invocation\x1f"
+        command = (
+            "set -x\n"
+            "printf '\\036prime-agent-complete:not-this-invocation\\037'\n"
+            "if [ -r /proc/$$/cmdline ]; then cat /proc/$$/cmdline; fi\n"
+            "printf '\\nafter-sentinel-lookalike\\n'"
+        )
+        with mock.patch.object(bash_module.secrets, "token_hex", return_value=token):
+            result = await asyncio.wait_for(bash(command), timeout=5)
+        actual_marker = (
+            bash_module._COMPLETION_PREFIX + token.encode() + bash_module._COMPLETION_SUFFIX
+        )
+        self.assertIn(raw_lookalike, result.output)
+        self.assertIn("after-sentinel-lookalike", result.output)
+        self.assertNotIn(actual_marker.decode(), result.output)
+
+    async def test_user_alias_cannot_replace_completion_emitter(self):
+        if os.path.basename(bash_module._shell()) != "bash":
+            self.skipTest("bash alias expansion semantics")
+        handle = bash(
+            "shopt -s expand_aliases; alias command='printf alias-expanded'; sleep 30 &"
+        )
+        try:
+            result = await asyncio.wait_for(handle, timeout=5)
+            self.assertEqual(result.exit_code, 0)
+            self.assertNotIn("alias-expanded", result.output)
+        finally:
+            handle.kill(signal.SIGKILL)
+            await _poll_group_dead(handle.pid)
+
+    async def test_user_function_cannot_replace_completion_emitter(self):
+        # The backslash in `\command` defeats alias expansion only: a shell
+        # function named `command` would otherwise swallow both fence frames
+        # and wedge the await behind the background job until shell death.
+        handle = bash("command() { printf function-expanded; }; sleep 30 &")
+        try:
+            result = await asyncio.wait_for(handle, timeout=5)
+            self.assertEqual(result.exit_code, 0)
+            self.assertNotIn("function-expanded", result.output)
+        finally:
+            handle.kill(signal.SIGKILL)
+            await _poll_group_dead(handle.pid)
+
+    async def test_shell_killed_before_sentinel_finalizes_from_exit(self):
+        result = await asyncio.wait_for(
+            bash("printf output-before-shell-kill; kill -KILL $$"), timeout=5
+        )
+        self.assertEqual(result.exit_code, -signal.SIGKILL)
+        self.assertIn("output-before-shell-kill", result.output)
 
     async def test_relative_bash_shell_override_rejected(self):
         with mock.patch.dict(os.environ, {"PRIME_AGENT_BASH_SHELL": "bash"}):

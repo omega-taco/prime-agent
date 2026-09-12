@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
@@ -46,10 +47,13 @@ except Exception as _prime_agent_rlm_error:
                 f"Import error: {_PRIME_AGENT_RLM_IMPORT_ERROR}"
             )
 
-        async def run(self, prompt, **kwargs):
+        async def spawn(self, prompt, **kwargs):
             self._raise_missing()
 
         async def find_models(self, query="", limit=8):
+            self._raise_missing()
+
+        async def create_session(self, prompt, **kwargs):
             self._raise_missing()
 
         async def list_subagents(self):
@@ -57,9 +61,6 @@ except Exception as _prime_agent_rlm_error:
 
         async def delete_subagent(self, target):
             self._raise_missing()
-
-        async def __call__(self, prompt, **kwargs):
-            return await self.run(prompt, **kwargs)
 
     rlm = _PrimeAgentMissingRlm()
 
@@ -287,8 +288,6 @@ export interface IpythonToolOptions {
 	/** Resolves before this kernel starts — e.g. the previous provisioner's dispose, so a
 	 * /reload's old-kernel snapshot flush can't race the new kernel's restore. */
 	readyGate?: Promise<unknown>;
-	/** Filled with the live kernel client after the first kernel start; cleared on construction. */
-	kernelManagerRef?: { current?: KernelClient };
 	/**
 	 * Fires once per kernel start when a previous session's namespace was revived
 	 * (some names restored or some failed), so the session can tell the model.
@@ -313,15 +312,13 @@ export class IpythonKernelProvisioner {
 	private lastStartupMessage?: string;
 	private _lastRestore?: RestoreResult;
 	private readonly disposeController = new AbortController();
+	/** Snapshot policy of the dispose that aborted a startup, honored by startKernel's failure teardown. */
+	private disposeSnapshot = true;
 
 	constructor(
 		private readonly cwd: string,
 		private readonly options?: Omit<IpythonToolOptions, "provisioner">,
-	) {
-		if (options?.kernelManagerRef) {
-			options.kernelManagerRef.current = undefined;
-		}
-	}
+	) {}
 
 	/** The kernel manager, once a startup has completed successfully. */
 	get manager(): KernelClient | undefined {
@@ -357,7 +354,8 @@ export class IpythonKernelProvisioner {
 	}
 
 	/** Dispose the kernel owned by this provisioner, including one still starting up. */
-	async dispose(): Promise<void> {
+	async dispose(options?: { snapshot?: boolean }): Promise<void> {
+		this.disposeSnapshot = options?.snapshot ?? true;
 		// Drops a still-queued boot out of the semaphore and short-circuits an
 		// in-flight startKernel before it spawns, so a disposed session's boot
 		// doesn't waste a slot during a fan-out.
@@ -365,13 +363,10 @@ export class IpythonKernelProvisioner {
 		const pending = this.managerPromise;
 		this.managerPromise = undefined;
 		this.startedManager = undefined;
-		if (this.options?.kernelManagerRef) {
-			this.options.kernelManagerRef.current = undefined;
-		}
 		if (!pending) return;
 		try {
 			const m = await pending;
-			await m.dispose();
+			await m.shutdown({ snapshot: this.disposeSnapshot, drainHostRequests: true });
 		} catch {
 			// a failed startup already cleaned up after itself
 		}
@@ -381,9 +376,6 @@ export class IpythonKernelProvisioner {
 		const pending = this.managerPromise;
 		this.managerPromise = undefined;
 		this.startedManager = undefined;
-		if (this.options?.kernelManagerRef) {
-			this.options.kernelManagerRef.current = undefined;
-		}
 		if (!pending) return;
 		try {
 			const m = await pending;
@@ -396,6 +388,11 @@ export class IpythonKernelProvisioner {
 	ensure(onProgress?: KernelBootstrapProgressHandler, signal?: AbortSignal): Promise<KernelClient> {
 		if (signal?.aborted) {
 			return Promise.reject(createAbortError());
+		}
+		// Only a terminally dead kernel drops the memo; a repairing manager (idle/starting) recovers itself.
+		if (this.startedManager?.isDefunct) {
+			this.managerPromise = undefined;
+			this.startedManager = undefined;
 		}
 		let cleanupProgressListener: (() => void) | undefined;
 		if (onProgress && !this.startedManager) {
@@ -466,6 +463,7 @@ export class IpythonKernelProvisioner {
 			// without bash, where the runtime's teaching error fires instead).
 			const shellPath = resolveKernelBashShell(this.options?.shellPath);
 			const commandPrefix = this.options?.commandPrefix;
+			const bootstrapCode = buildRlmBootstrapCode(this.options?.pythonSkills);
 			const m = new ReplKernelManager({
 				python: this.options?.python,
 				cwd: this.cwd,
@@ -482,6 +480,8 @@ export class IpythonKernelProvisioner {
 				snapshot: snapshotDir
 					? { path: snapshotPathIn(snapshotDir), manifestPath: manifestPathIn(snapshotDir) }
 					: undefined,
+				stderrLogPath: snapshotDir ? join(snapshotDir, "kernel-stderr.log") : undefined,
+				bootstrapCode,
 			});
 			let pendingRestore: RestoreResult | undefined;
 			try {
@@ -512,7 +512,7 @@ export class IpythonKernelProvisioner {
 					}
 				}
 				this.emitStartupProgress("Preparing Python runtime...");
-				const bootstrap = await m.execute(buildRlmBootstrapCode(this.options?.pythonSkills), {
+				const bootstrap = await m.execute(bootstrapCode, {
 					signal: startupSignal,
 				});
 				if (bootstrap.status !== "ok") {
@@ -520,8 +520,11 @@ export class IpythonKernelProvisioner {
 					throw new Error(`Failed to initialize rlm runtime in the Python kernel:\n${details}`);
 				}
 			} catch (error) {
-				// Never leak the kernel process if startup fails after spawn.
-				void m.dispose();
+				// Never leak the kernel process if startup fails after spawn — and never
+				// surface the failure before the teardown (final snapshot flush included)
+				// finished, or a replacement provisioner gated on this dispose could
+				// race the still-flushing kernel over the same snapshot files.
+				await m.shutdown({ snapshot: this.disposeSnapshot, drainHostRequests: true }).catch(() => undefined);
 				throw error;
 			}
 			// Only tell the model what was revived once the kernel is actually usable —
@@ -529,9 +532,6 @@ export class IpythonKernelProvisioner {
 			if (pendingRestore) {
 				this._lastRestore = pendingRestore;
 				this.options?.onRestore?.(pendingRestore);
-			}
-			if (this.options?.kernelManagerRef) {
-				this.options.kernelManagerRef.current = m;
 			}
 			return m;
 		} finally {

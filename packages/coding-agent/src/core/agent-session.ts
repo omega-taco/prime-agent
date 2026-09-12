@@ -42,17 +42,20 @@ import {
 	AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL,
 	AGENT_MESSAGE_SKILL_NAME,
 	type AgentFamilyCatalogEntry,
-	type AgentFamilyRosterResult,
 	type AgentSessionMessage,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
 	type AgentSessionMessageListResult,
 	type AgentSessionMessageReceipt,
+	agentFamilyMemberName,
+	assertAgentMessageQueueCapacity,
 	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
 	createAgentMessageHostHandlers,
+	DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 	formatAgentSessionNameUnavailable,
 	isAgentSessionMessage,
+	isAgentSessionMessagePrompt,
 	normalizeAgentSessionMessage,
 	parseAgentSessionMessagePromptId,
 	startsAgentRun,
@@ -68,7 +71,6 @@ import {
 	normalizeObserveMaxChars,
 	ORCHESTRATION_HEARTBEAT_SKILL_NAME,
 } from "./agent-observe.js";
-import { flushAgentTraceUpload } from "./agent-traces.js";
 import {
 	addLoginGuidanceToAuthError,
 	formatAuthenticationFailedMessage,
@@ -85,9 +87,12 @@ import {
 	addAutonomousUsage,
 	autonomousStatus,
 	createAutonomousRuntimeState,
+	isUnlimitedAutonomousLimit,
 	nextAutonomousContinuation,
 	refreshAutonomousQualityGates,
 	setAutonomousEnabled,
+	setAutonomousLimits,
+	UNLIMITED_AUTONOMOUS_LIMIT,
 } from "./autonomous.js";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
 import {
@@ -163,33 +168,52 @@ import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
 import type { AcpMcpServerConfig } from "./mcp/acp-mcp-types.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
 import {
+	ASYNC_BASH_COMPLETION_CUSTOM_TYPE,
+	ASYNC_BASH_COMPLETION_PREVIEW_LABEL,
+	type AsyncBashCompletionDetails,
 	type BashExecutionMessage,
 	type CompactionOutcome,
 	type CompactionOutcomeReason,
 	type CustomMessage,
 	convertToLlm,
+	createAsyncBashCompletionMessage,
 	createCompactionOutcomeMessage,
+	createHarnessDigestMessage,
 	createHeartbeatPromptMessage,
+	createRefinementNoticeMessage,
 	createRefinementOutcomeMessage,
 	createRlmChildFailureMessage,
 	createRlmChildTerminalNoticeMessage,
 	createSessionSlashCommandMessage,
 	createSessionSlashCommandResultMessage,
+	HARNESS_DIGEST_CUSTOM_TYPE,
+	type HarnessDigestDetails,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	isSessionSlashCommandMessage,
+	type RefinementSource,
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
-import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
+import { expandPromptTemplate, type PromptTemplate, parseCommandArgs } from "./prompt-templates.js";
+import {
+	isAgentLifecycleFailure,
+	isFauxProviderQueueExhausted,
+	isPermanentProviderFailureKind,
+	providerRetryDelay,
+	providerRetryPolicy,
+	providerStreamFailureKind,
+	providerStreamFailureRetryAfterMs,
+} from "./provider-retry.js";
 import {
 	type AutoRefineReason,
 	type AutoRefineReview,
 	appendGlobalRefinement,
 	applyRefinementProposal,
+	formatHarnessStateForPrompt,
 	generateRefinementId,
 	getGlobalHarnessStateDir,
 	getLocalHarnessStateDir,
@@ -212,7 +236,10 @@ import { resolveConfigValue } from "./resolve-config-value.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
+	createAsyncBashCompletionHostHandler,
+	createAsyncBashConsumedHostHandler,
 	createDefaultRlmSubagentSessionName,
+	createRlmCreateSessionHostHandler,
 	createRlmDeleteSubagentHostHandler,
 	createRlmFindModelsHostHandler,
 	createRlmListSubagentsHostHandler,
@@ -221,6 +248,7 @@ import {
 	normalizeRequestedRlmSubagentModel,
 	normalizeRequestedRlmSubagentSessionName,
 	normalizeRequestedRlmSubagentThinkingLevel,
+	type RlmCreateSessionResult,
 	type RlmDeleteSubagentResult,
 	type RlmFindModelsResult,
 	type RlmListSubagentsResult,
@@ -229,6 +257,12 @@ import {
 	type RlmSubagentRuntime,
 	type SubagentRuntimeHost,
 } from "./rlm-runtime.js";
+import {
+	modelRequestHeaders,
+	SemanticEdgeRecorder,
+	semanticEdgeLedgerPath,
+	wrapStreamFnWithSemanticEdges,
+} from "./semantic-edges.js";
 import {
 	ActionStore,
 	type ActionTicket,
@@ -247,7 +281,14 @@ import {
 	transitionSessionAction,
 	type WakePolicy,
 } from "./session-action-store.js";
-import type { BranchSummaryEntry, CompactionEntry, SessionContext, SessionMessageEntry } from "./session-manager.js";
+import type {
+	BranchSummaryEntry,
+	ChildUsageAttributionEntry,
+	CompactionEntry,
+	SessionContext,
+	SessionEntry,
+	SessionMessageEntry,
+} from "./session-manager.js";
 import {
 	CURRENT_SESSION_VERSION,
 	getLatestCompactionEntry,
@@ -267,11 +308,19 @@ import {
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
 import { THINKING_LEVELS } from "./thinking-levels.js";
+import { acpMcpToolNames, createAcpMcpToolDefinitions } from "./tools/acp-mcp.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
 import { IpythonKernelProvisioner } from "./tools/ipython.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
-import { addAssistantUsage, emptyUsage } from "./usage.js";
+import {
+	addAssistantUsage,
+	cloneUsage,
+	emptyUsage,
+	type SessionUsageSummary,
+	sessionUsageSummaryFrom,
+	subtractAssistantUsage,
+} from "./usage.js";
 import { SERPER_CREDENTIAL_ID, SERPER_ENV_VAR, WEBSEARCH_SKILL_NAME } from "./websearch-credential.js";
 
 export type { GoalState, GoalStatus } from "./goals.js";
@@ -439,6 +488,8 @@ export interface AgentSessionConfig {
 	rlmSessionDir?: string;
 	rlmParentNodeId?: string;
 	rlmParentAgent?: string;
+	semanticParentSessionId?: string;
+	semanticSpawnedByRequestId?: string;
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	autonomous?: AgentAutonomousConfig;
 	prewarmIpythonKernel?: boolean;
@@ -484,6 +535,7 @@ export type SerializedBackgroundPlanResult =
 			options: { instructions?: string; rollbackId?: string; global?: boolean };
 			abort: AbortController;
 			branchVersion: number;
+			source: Exclude<RefinementSource, "user">;
 	  }
 	| { status: "skip"; explicit?: boolean }
 	| { status: "invalidated"; branchVersion: number }
@@ -614,6 +666,8 @@ interface PreparedPromptPreparation {
 
 class DeferredSessionInputError extends Error {}
 
+class SessionInputAdmissionPausedError extends Error {}
+
 function oncePreflight(
 	preflightResult: ((success: boolean, queued?: boolean) => void) | undefined,
 ): (success: boolean, queued?: boolean) => void {
@@ -723,6 +777,12 @@ function queuedAgentMessagePreview(action: QueuedSessionAction): string {
 	if (payload.customMessage && isAgentSessionMessage(payload.customMessage)) {
 		return `${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: ${payload.customMessage.details.message}`;
 	}
+	if (payload.customMessage?.customType === ASYNC_BASH_COMPLETION_CUSTOM_TYPE) {
+		const details = payload.customMessage.details as AsyncBashCompletionDetails | undefined;
+		return details
+			? `${ASYNC_BASH_COMPLETION_PREVIEW_LABEL}: pid ${details.pid}, exit ${details.exitCode}`
+			: ASYNC_BASH_COMPLETION_PREVIEW_LABEL;
+	}
 	return payload.preview ?? payload.text;
 }
 
@@ -800,6 +860,8 @@ function injectedMessagePreviewLabel(message: CustomMessage): string | undefined
 	switch (message.customType) {
 		case HEARTBEAT_PROMPT_CUSTOM_TYPE:
 			return HEARTBEAT_PROMPT_PREVIEW_LABEL;
+		case ASYNC_BASH_COMPLETION_CUSTOM_TYPE:
+			return ASYNC_BASH_COMPLETION_PREVIEW_LABEL;
 		case GOAL_CONTEXT_CUSTOM_TYPE:
 			return GOAL_CONTEXT_PREVIEW_LABEL;
 		default:
@@ -830,11 +892,12 @@ function createAgentMessageDeferred(): AgentMessageDeferred {
 
 /** One-shot settlement for a scheduled post-compaction continuation; a settled failure is never re-exposed to later waiters. */
 interface PostCompactionContinuationSettlement extends AgentMessageDeferred {
+	continueAfterSessionInput: boolean;
 	settled: boolean;
 }
 
 function createPostCompactionContinuationSettlement(): PostCompactionContinuationSettlement {
-	return { ...createAgentMessageDeferred(), settled: false };
+	return { ...createAgentMessageDeferred(), continueAfterSessionInput: false, settled: false };
 }
 
 export interface ModelCycleResult {
@@ -860,7 +923,7 @@ type GoalSlashCommand =
 	| { kind: "resume" }
 	| { kind: "start"; objective: string; tokenBudget?: number };
 
-type AutonomousSlashCommand = { kind: "status" } | { kind: "on" } | { kind: "off" };
+type AutonomousSlashCommand = { kind: "status" } | { kind: "on"; config?: AgentAutonomousConfig } | { kind: "off" };
 
 import type { RlmMaxDepthSource, RlmMaxDepthStatus, SetRlmMaxDepthResult } from "./rlm-max-depth.js";
 
@@ -882,6 +945,10 @@ interface RlmChildRun {
 	sessionDir: string;
 	model: Model<Api>;
 	status: RlmChildAgentStatus;
+	durationMs?: number;
+	answerPreview?: string;
+	toolUseCount: number;
+	activity?: RlmChildAgentActivity;
 	error?: string;
 	abort: () => void;
 	publication: AgentMessageDeferred;
@@ -904,11 +971,18 @@ interface RlmChildRun {
 	deletionCleanupFailed?: boolean;
 	deletionRunFinished?: boolean;
 	deletionNotice?: Promise<void>;
+	deletionFailureNotice?: Promise<void>;
 	deletionNeedsCompletionNotice?: boolean;
 	completeDeletion?: () => Promise<void>;
 	reportDeletionCleanupFailure?: (error: unknown) => Promise<void>;
 	emitUpdate?: () => void;
+	lastEmittedUpdate?: string;
 	unsubscribe?: () => void;
+}
+
+interface RetainedRlmChild {
+	session: AgentSession;
+	run?: RlmChildRun;
 }
 
 interface RlmSubagentModelSelection {
@@ -964,6 +1038,111 @@ function parseGoalBudgetValue(value: string): number {
 	return budget;
 }
 
+const AUTONOMOUS_STATUS_NUMBER_FORMAT = new Intl.NumberFormat("en-US");
+
+const AUTONOMOUS_BUDGET_USAGE =
+	"Usage: /autonomous [status|off] or /autonomous on [--max-continuations <n|unlimited>] [--max-turns <n|unlimited>] [--max-tokens <n|unlimited>] [--timeout-ms <n|unlimited>] [--gate <command>] [--gate-retries <n>] [--gate-timeout-ms <n>]";
+
+// `/autonomous` budget flags mirror the `--autonomous-*` CLI options. The CLI
+// spelling (`--autonomous-max-continuations`) is accepted as an alias so the
+// exact CLI budget flags also work from the slash command.
+const AUTONOMOUS_BUDGET_FLAGS: ReadonlySet<string> = new Set([
+	"max-continuations",
+	"max-turns",
+	"max-tokens",
+	"timeout-ms",
+	"gate",
+	"gate-retries",
+	"gate-timeout-ms",
+]);
+
+function parseAutonomousBudgetInt(flag: string, value: string, allowUnlimited = false): number {
+	if (allowUnlimited && value.toLowerCase() === "unlimited") {
+		return UNLIMITED_AUTONOMOUS_LIMIT;
+	}
+	// Commas and underscores are accepted as digit separators (100,000,000).
+	const digits = value.replace(/[,_]/g, "");
+	if (!/^[1-9]\d*$/.test(digits)) {
+		throw new Error(
+			`--${flag} must be a positive integer${allowUnlimited ? ' or "unlimited"' : ""}. ${AUTONOMOUS_BUDGET_USAGE}`,
+		);
+	}
+	return Number(digits);
+}
+
+function parseAutonomousBudgetOptions(tokens: string[]): AgentAutonomousConfig {
+	const config: AgentAutonomousConfig = {};
+	const gateCommands: string[] = [];
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i]!;
+		if (!token.startsWith("--")) {
+			throw new Error(`Unexpected autonomous argument: ${token}. ${AUTONOMOUS_BUDGET_USAGE}`);
+		}
+		const equalsIndex = token.indexOf("=");
+		const rawFlag = equalsIndex === -1 ? token : token.slice(0, equalsIndex);
+		const inlineValue = equalsIndex === -1 ? undefined : token.slice(equalsIndex + 1);
+		const flag = rawFlag.startsWith("--autonomous-") ? rawFlag.slice("--autonomous-".length) : rawFlag.slice(2);
+		if (!AUTONOMOUS_BUDGET_FLAGS.has(flag)) {
+			throw new Error(`Unknown autonomous budget flag: ${rawFlag}. ${AUTONOMOUS_BUDGET_USAGE}`);
+		}
+		let value = inlineValue;
+		if (value === undefined) {
+			const next = tokens[i + 1];
+			if (next === undefined || next.startsWith("--")) {
+				throw new Error(`Missing value for ${rawFlag}. ${AUTONOMOUS_BUDGET_USAGE}`);
+			}
+			value = next;
+			i++;
+		}
+		if (value === "") {
+			throw new Error(`Missing value for ${rawFlag}. ${AUTONOMOUS_BUDGET_USAGE}`);
+		}
+		switch (flag) {
+			case "gate":
+				gateCommands.push(value);
+				break;
+			case "gate-retries":
+				config.gates = config.gates ?? {};
+				config.gates.maxRetries = parseAutonomousBudgetInt(flag, value);
+				break;
+			case "gate-timeout-ms":
+				config.gates = config.gates ?? {};
+				config.gates.timeoutMs = parseAutonomousBudgetInt(flag, value);
+				break;
+			case "max-continuations":
+				config.maxContinuations = parseAutonomousBudgetInt(flag, value, true);
+				break;
+			case "max-turns":
+				config.maxTurns = parseAutonomousBudgetInt(flag, value, true);
+				break;
+			case "max-tokens":
+				config.maxTokens = parseAutonomousBudgetInt(flag, value, true);
+				break;
+			case "timeout-ms":
+				config.timeoutMs = parseAutonomousBudgetInt(flag, value, true);
+				break;
+		}
+	}
+	if (gateCommands.length > 0) {
+		config.gates = { ...config.gates, commands: gateCommands };
+	}
+	// Named budget flags define the whole budget: any limit the user did not
+	// name stops cutting the run short. With no budget flags at all, the
+	// configured or default limits still apply.
+	if (
+		config.maxContinuations !== undefined ||
+		config.maxTurns !== undefined ||
+		config.maxTokens !== undefined ||
+		config.timeoutMs !== undefined
+	) {
+		config.maxContinuations ??= UNLIMITED_AUTONOMOUS_LIMIT;
+		config.maxTurns ??= UNLIMITED_AUTONOMOUS_LIMIT;
+		config.maxTokens ??= UNLIMITED_AUTONOMOUS_LIMIT;
+		config.timeoutMs ??= UNLIMITED_AUTONOMOUS_LIMIT;
+	}
+	return config;
+}
+
 export function compactRlmText(text: string, maxLength = 160): string {
 	const compact = text.replace(/\s+/g, " ").trim();
 	if (compact.length <= maxLength) {
@@ -1013,6 +1192,26 @@ function waitForPromiseOrAbort<T>(
 			},
 		);
 	});
+}
+
+// Bounds how much accumulated child usage a parent process crash can lose.
+const RLM_CHILD_USAGE_FLUSH_MAX_PENDING_MS = 60_000;
+
+/** Label a child completion's usage by the nearest preceding prompt that triggered it. */
+function rlmChildUsageOrigin(
+	messages: readonly AgentMessage[],
+	assistant: AssistantMessage,
+): ChildUsageAttributionEntry["origin"] {
+	for (let index = messages.lastIndexOf(assistant) - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role !== "user" && message.role !== "custom") continue;
+		return message.role === "custom" && isAgentSessionMessage(message)
+			? message.details.id.startsWith("spawn:")
+				? "spawn_task"
+				: "agent_message"
+			: "direct_user";
+	}
+	return "direct_user";
 }
 
 function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
@@ -1065,7 +1264,7 @@ export class AgentSession {
 	private _pendingSessionActionFenceWaiters = 0;
 	private readonly _sessionActionCommitContext = new AsyncLocalStorage<symbol>();
 	private readonly _sessionActionCommitDisposeAbortController = new AbortController();
-	// Checkpoint and handoff waiters share lifecycle-edge notifications to avoid polling.
+	// Checkpoint, handoff, and activity waiters share lifecycle-edge notifications to avoid polling.
 	private readonly _sessionInputCheckpointWaiters = new Set<() => void>();
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 
@@ -1092,15 +1291,20 @@ export class AgentSession {
 
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+	/** Bumped by every retry resolution; stale scheduled-continue callbacks check it before touching retry state. */
+	private _retryGeneration = 0;
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
 	private _retryAuthFailureSources: AuthSourceToken[] = [];
+	private _agentMessageClearEpoch = 0;
 	private _agentMessageOutcomes = new Map<string, AgentMessageOutcome>();
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
 	/** Outcome disclosures whose session-file append failed; retained for context rebuilds. */
 	private readonly _unpersistedOutcomes: CustomMessage[] = [];
+	/** Fresh/empty contexts defer digest injection to the first committed turn so untouched sessions stay empty. */
+	private _harnessDigestPending = false;
 
-	private _bashAbortController: AbortController | undefined = undefined;
+	private _bashAbortControllers = new Set<AbortController>();
 	private _userBashRunning = false;
 	private _userBashAbortRequested = false;
 	private _pendingBashMessages: BashExecutionMessage[] = [];
@@ -1114,6 +1318,7 @@ export class AgentSession {
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
+	private _acpMcpTools: ToolDefinition[] = [];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
 	private _agentDir?: string;
@@ -1151,11 +1356,16 @@ export class AgentSession {
 	private _rlmMaxDepth: number;
 	private _rlmMaxDepthSource: RlmMaxDepthSource;
 	private _rlmSessionDir?: string;
+	private readonly _semanticEdges: SemanticEdgeRecorder;
 	private _rlmParentNodeId?: string;
 	private _rlmParentAgent?: string;
 	private _repliedToParentSinceTask: boolean | undefined;
 	private _parentReplyCount = 0;
 	private _subagentRuntimeHost?: SubagentRuntimeHost;
+	// Shared by children charged to the same assistant; excludes usage not yet attributed on disk.
+	private _rlmDurableParentUsage = new WeakMap<AssistantMessage, Usage>();
+	// Child usage not yet represented by an indexed attribution, including a delayed parent entry.
+	private _rlmUnindexedChildUsage = new WeakMap<AssistantMessage, Usage>();
 	private _activeRlmChildRuns = new Map<string, RlmChildRun>();
 	private _unsettledRlmChildRuns = new Set<RlmChildRun>();
 	private _abandonedRlmQuiescenceChildIds = new Set<string>();
@@ -1163,7 +1373,7 @@ export class AgentSession {
 	private _pendingRlmSubagentSessionNames = new Set<string>();
 	// Inline mode keeps finished child sessions so the inspector can still read them;
 	// the daemon does the same by leaving the child session resident in its registry.
-	private _rlmChildSessions = new Map<string, AgentSession>();
+	private _rlmChildSessions = new Map<string, RetainedRlmChild>();
 	private _deletedRlmChildIds = new Set<string>();
 	// Failed explicit deletes stay hidden from listings but retain their original
 	// selector so a later delete can retry cleanup without orphaning the runtime.
@@ -1198,7 +1408,6 @@ export class AgentSession {
 	private _compactAutoRefinePending = false;
 	private _turnIntervalAutoRefinePending = false;
 	private _postCompactionContinuationScheduled = false;
-	private _postCompactionContinuationTimer: ReturnType<typeof setTimeout> | undefined;
 	private _postCompactionContinuationSettlement: PostCompactionContinuationSettlement | undefined;
 	private _postCompactionContinuationMessages: AgentMessage[] = [];
 	private _scheduledPostCompactionContinuationMessages: AgentMessage[] = [];
@@ -1260,6 +1469,16 @@ export class AgentSession {
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._rlmParentAgent = config.rlmParentAgent;
+		this._semanticEdges = new SemanticEdgeRecorder({
+			ledgerPath: semanticEdgeLedgerPath({
+				rlmSessionDir: this._rlmSessionDir,
+				sessionArtifactDir: this.sessionManager.getSessionArtifactDir(),
+			}),
+			sessionId: this.sessionManager.getSessionId(),
+			parentSessionId: config.semanticParentSessionId,
+			spawnedByRequestId: config.semanticSpawnedByRequestId,
+		});
+		this.agent.streamFn = wrapStreamFnWithSemanticEdges(this.agent.streamFn, this._semanticEdges);
 		// A resumed child may have replied before this process started; false would
 		// claim knowledge that is not present in the session transcript.
 		this._repliedToParentSinceTask =
@@ -1296,6 +1515,7 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
+		this._ensureHarnessDigestContext();
 	}
 
 	/** Refreshes MCP provider registrations without rebuilding the session runtime. */
@@ -1327,6 +1547,10 @@ export class AgentSession {
 			if (servers.length > 0) throw new Error("MCP is unavailable in this session");
 			return;
 		}
+		if (servers.length > 0 && !this._ipythonKernelProvisioner) {
+			throw new Error("ACP MCP servers require the built-in cpython tool");
+		}
+		this._assertAcpMcpToolNamesAvailable(acpMcpToolNames(servers));
 		if (!this._mcpManager.replaceAcpServers(servers, ownerId)) return;
 		this._rebuildRuntimeForAcpMcpServers();
 	}
@@ -1334,8 +1558,11 @@ export class AgentSession {
 	async releaseAcpMcpServers(ownerId: string, serverNames: readonly string[]): Promise<void> {
 		if (!this._mcpManager?.canReleaseAcpServers(ownerId)) return;
 		if (this._mcpManager.replaceAcpServers([], ownerId)) {
-			// Host MCP handlers read this manager dynamically, so credentials disappear
-			// before the kernel-side transport is closed.
+			const removedToolNames = new Set(this._acpMcpTools.map((tool) => tool.name));
+			const activeToolNames = this.getActiveToolNames().filter((name) => !removedToolNames.has(name));
+			for (const name of removedToolNames) this._allowedToolNames?.delete(name);
+			this._acpMcpTools = [];
+			this._refreshToolRegistry({ activeToolNames, includeAllExtensionTools: true });
 			this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
 			this.agent.state.systemPrompt = this._baseSystemPrompt;
 		}
@@ -1373,9 +1600,27 @@ export class AgentSession {
 		}
 	}
 
+	private _assertAcpMcpToolNamesAvailable(names: readonly string[]): void {
+		const occupiedNames = new Set([
+			...this._baseToolDefinitions.keys(),
+			...this._customTools.map((tool) => tool.name),
+			...this._extensionRunner.getAllRegisteredTools().map((tool) => tool.definition.name),
+		]);
+		for (const name of names) {
+			if (occupiedNames.has(name)) {
+				throw new Error(`ACP MCP tool name conflicts with an existing tool: ${name}`);
+			}
+		}
+	}
+
 	private _rebuildRuntimeForAcpMcpServers(): void {
+		const previousToolNames = new Set(this._acpMcpTools.map((tool) => tool.name));
+		const nextToolNames = acpMcpToolNames(this._mcpManager?.getAcpServers() ?? []);
+		this._assertAcpMcpToolNamesAvailable(nextToolNames);
+		const activeToolNames = this.getActiveToolNames().filter((name) => !previousToolNames.has(name));
+		activeToolNames.push(...nextToolNames);
 		this._buildRuntime({
-			activeToolNames: this.getActiveToolNames(),
+			activeToolNames,
 			includeAllExtensionTools: true,
 		});
 		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
@@ -1393,6 +1638,7 @@ export class AgentSession {
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
 		apiKey: string;
 		headers?: Record<string, string>;
+		requestModel: Model<Api>;
 	}> {
 		const result = await this._modelRegistry.getApiKeyAndHeaders(model);
 		if (!result.ok) {
@@ -1402,7 +1648,7 @@ export class AgentSession {
 			throw new Error(result.error);
 		}
 		if (result.apiKey) {
-			return { apiKey: result.apiKey, headers: result.headers };
+			return { apiKey: result.apiKey, headers: result.headers, requestModel: result.requestModel ?? model };
 		}
 
 		const isOAuth = this._modelRegistry.isUsingOAuth(model);
@@ -1740,10 +1986,21 @@ export class AgentSession {
 						(record): record is DeliveryRecord & { message: CustomMessage } =>
 							(record.role === "next_turn" || (payload.acceptedAgentMessage && record.role === "prefix")) &&
 							record.message.role === "custom" &&
+							record.message.customType !== HARNESS_DIGEST_CUSTOM_TYPE &&
 							!record.durable,
 					)
 					.map((record) => cloneCustomMessage(record.message));
 				restorableMessages.push(...restorable);
+				// Lazy injection owns digest delivery: a cancelled turn re-arms it
+				// instead of restoring a possibly stale digest message.
+				if (
+					payload.records.some(
+						(record) =>
+							record.message.role === "custom" && record.message.customType === HARNESS_DIGEST_CUSTOM_TYPE,
+					)
+				) {
+					this._harnessDigestPending = true;
+				}
 				if (dispatched) {
 					payload.captureRunMessages = new Set(payload.records.map((record) => record.message));
 					this.agent.state.messages = this.agent.state.messages.filter(
@@ -1943,23 +2200,38 @@ export class AgentSession {
 	private _parseAutonomousSlashCommand(text: string): AutonomousSlashCommand | undefined {
 		const command = parseSessionSlashCommand(text);
 		if (command?.name !== "autonomous") return undefined;
-		const rest = command.args.toLowerCase();
-		if (!rest || rest === "status") {
+		const tokens = parseCommandArgs(command.args);
+		if (tokens.length === 0 || tokens[0]!.toLowerCase() === "status") {
+			if (tokens.length > 1) {
+				throw new Error(`Unexpected autonomous argument: ${tokens[1]}. ${AUTONOMOUS_BUDGET_USAGE}`);
+			}
 			return { kind: "status" };
 		}
-		if (rest === "on" || rest === "enable" || rest === "enabled") {
-			return { kind: "on" };
+		const subcommand = tokens[0]!.toLowerCase();
+		if (subcommand === "on" || subcommand === "enable" || subcommand === "enabled") {
+			return { kind: "on", config: parseAutonomousBudgetOptions(tokens.slice(1)) };
 		}
-		if (rest === "off" || rest === "disable" || rest === "disabled") {
+		if (subcommand === "off" || subcommand === "disable" || subcommand === "disabled") {
+			if (tokens.length > 1) {
+				throw new Error(`Unexpected autonomous argument: ${tokens[1]}. ${AUTONOMOUS_BUDGET_USAGE}`);
+			}
 			return { kind: "off" };
 		}
-		throw new Error("Usage: /autonomous [on|off|status]");
+		throw new Error(AUTONOMOUS_BUDGET_USAGE);
 	}
 
 	private _formatAutonomousStatus(): string {
 		const status = this.getAutonomousStatus();
 		const state = status.enabled ? "on" : "off";
-		return `Autonomous mode: ${state}. Continuations: ${status.continuationsUsed}/${status.limits.maxContinuations}. Turns: ${status.turnsUsed}/${status.limits.maxTurns}. Tokens: ${status.tokensUsed}/${status.limits.maxTokens}.`;
+		const elapsedSeconds = status.startedAt ? Math.round((Date.now() - status.startedAt) / 1000) : 0;
+		const gateSummary =
+			status.gates.commands.length > 0 ? status.gates.commands.map((command) => `"${command}"`).join(", ") : "none";
+		const formatCount = (value: number): string =>
+			isUnlimitedAutonomousLimit(value) ? "unlimited" : AUTONOMOUS_STATUS_NUMBER_FORMAT.format(value);
+		const timeBudget = isUnlimitedAutonomousLimit(status.limits.timeoutMs)
+			? "unlimited"
+			: `${AUTONOMOUS_STATUS_NUMBER_FORMAT.format(Math.round(status.limits.timeoutMs / 1000))}s`;
+		return `[autonomous-status: ${state}]\n\nContinuations: ${formatCount(status.continuationsUsed)}/${formatCount(status.limits.maxContinuations)}. Turns: ${formatCount(status.turnsUsed)}/${formatCount(status.limits.maxTurns)}. Tokens: ${formatCount(status.tokensUsed)}/${formatCount(status.limits.maxTokens)}. Time: ${elapsedSeconds}s/${timeBudget}. Gates: ${gateSummary}.`;
 	}
 
 	private _emitAutonomousStatus(): void {
@@ -1989,6 +2261,7 @@ export class AgentSession {
 		}
 		if (command.kind === "on") {
 			setAutonomousEnabled(this._autonomousState, true, { cwd: this._cwd });
+			setAutonomousLimits(this._autonomousState, command.config);
 		} else if (command.kind === "off") {
 			setAutonomousEnabled(this._autonomousState, false);
 			this._clearQueuedAutonomousContinuations();
@@ -2354,7 +2627,7 @@ export class AgentSession {
 		if (pending) {
 			this._pendingRequestedRefine = undefined;
 			try {
-				await this._runSerializedRefine(pending);
+				await this._runSerializedRefine(pending, "self");
 			} catch (error) {
 				this._emitRefineFailed(error);
 			}
@@ -2500,12 +2773,13 @@ export class AgentSession {
 		});
 		this._refineInFlight = applySettled;
 		try {
-			await this._applyRefine(bgResult.plan, bgResult.options, bgResult.abort);
+			await this._applyRefine(bgResult.plan, bgResult.options, bgResult.abort, bgResult.source);
 		} finally {
 			resolveApplySettled();
 			if (this._refineInFlight === applySettled) {
 				this._refineInFlight = undefined;
 			}
+			this._notifySessionInputCheckpointChange();
 			this._scheduleSessionInputPump();
 		}
 	}
@@ -2612,6 +2886,7 @@ export class AgentSession {
 				options: planOptions,
 				abort: refineAbort,
 				branchVersion,
+				source: skipReview ? "self" : "auto",
 			};
 		} catch (error) {
 			if (this._disposed || this._disposing || branchVersion !== this._autoRefineBranchVersion) {
@@ -2646,7 +2921,7 @@ export class AgentSession {
 			rollbackId?: string;
 			global?: boolean;
 		},
-		trigger: "manual" | "auto" = "manual",
+		source: Exclude<RefinementSource, "user">,
 	): Promise<void> {
 		if (this._disposed || this._disposing) {
 			return;
@@ -2671,7 +2946,7 @@ export class AgentSession {
 		const refineAbort = new AbortController();
 		this._refineAbortController = refineAbort;
 
-		const planRun = this._planRefine(options, refineAbort.signal, trigger);
+		const planRun = this._planRefine(options, refineAbort.signal, source === "auto" ? "auto" : "manual");
 		const planSettled = planRun.then(
 			() => undefined,
 			() => undefined,
@@ -2708,12 +2983,13 @@ export class AgentSession {
 		});
 		this._refineInFlight = applySettled;
 		try {
-			await this._applyRefine(plan, options, refineAbort);
+			await this._applyRefine(plan, options, refineAbort, source);
 		} finally {
 			resolveApplySettled();
 			if (this._refineInFlight === applySettled) {
 				this._refineInFlight = undefined;
 			}
+			this._notifySessionInputCheckpointChange();
 			this._scheduleSessionInputPump();
 		}
 	}
@@ -2974,7 +3250,6 @@ export class AgentSession {
 				if (instructions !== undefined && typeof instructions !== "string") {
 					throw new Error("compact.run instructions must be a string when provided");
 				}
-				// "status" is reserved by the host-request reply protocol; don't use it as a key.
 				if (!this.isStreaming) {
 					return {
 						scheduled: false,
@@ -3062,7 +3337,7 @@ export class AgentSession {
 				}
 				return {
 					scheduled: true,
-					note: "Refinement runs when the current turn ends; the harness rebuilds the system prompt and resumes you automatically. Continue working normally.",
+					note: "Refinement runs when the current turn ends; applied edits are appended to your context as a refinement notice and you resume automatically. Continue working normally.",
 				};
 			}
 			default:
@@ -3167,18 +3442,11 @@ export class AgentSession {
 	handleAgentMessageHostRequest(
 		type: string,
 		payload: Record<string, unknown> = {},
-	):
-		| Promise<AgentSessionMessageListResult | AgentSessionMessageReceipt | AgentFamilyRosterResult>
-		| AgentSessionMessageListResult
-		| AgentFamilyRosterResult {
+	): Promise<AgentSessionMessageReceipt> {
 		if (!this._agentMessageController) {
 			throw new Error("agent messaging is not available in this session");
 		}
 		switch (type) {
-			case "agent_message.list_agents":
-				if (!this._agentMessageController.roster)
-					throw new Error("agent family roster is not available in this session");
-				return this._agentMessageController.roster();
 			case "agent_message.send": {
 				if (typeof payload.target !== "string") {
 					throw new Error("agent_message.send target must be a string");
@@ -3700,10 +3968,13 @@ export class AgentSession {
 	}
 
 	private _resolveRetry(): void {
+		this._retryGeneration += 1;
+		this._semanticEdges.clearTurnRetry();
 		if (this._retryResolve) {
 			this._retryResolve();
 			this._retryResolve = undefined;
 			this._retryPromise = undefined;
+			this._notifySessionInputCheckpointChange();
 			this._scheduleSessionInputPump();
 		}
 	}
@@ -3860,7 +4131,7 @@ export class AgentSession {
 	 * (which flushes a final namespace snapshot) before the synchronous dispose, so
 	 * the latest state reaches disk instead of racing process exit.
 	 */
-	async disposeAsync(): Promise<void> {
+	async disposeAsync(options?: { kernelSnapshot?: boolean }): Promise<void> {
 		if (this._disposed) {
 			return this._disposeCallbacksPromise;
 		}
@@ -3869,6 +4140,7 @@ export class AgentSession {
 		if (this._disposeAsyncPromise) {
 			return this._disposeAsyncPromise;
 		}
+		const kernelSnapshot = options?.kernelSnapshot ?? true;
 		this._disposeAsyncPromise = (async () => {
 			// Drain before marking _disposing so a refine triggered at the final
 			// agent_end completes instead of being aborted by dispose().
@@ -3878,7 +4150,7 @@ export class AgentSession {
 			}
 			this._disposing = true;
 			this._sessionActionCommitDisposeAbortController.abort();
-			await this._disposeAsyncOnce();
+			await this._disposeAsyncOnce(kernelSnapshot);
 		})();
 		return this._disposeAsyncPromise;
 	}
@@ -3957,7 +4229,7 @@ export class AgentSession {
 			const pending = this._pendingRequestedRefine;
 			this._pendingRequestedRefine = undefined;
 			try {
-				await this._runSerializedRefine(pending);
+				await this._runSerializedRefine(pending, "self");
 			} catch {
 				// Best-effort drain; refinement errors must not block disposal.
 			}
@@ -4015,7 +4287,7 @@ export class AgentSession {
 		}
 	}
 
-	private async _disposeAsyncOnce(): Promise<void> {
+	private async _disposeAsyncOnce(kernelSnapshot: boolean): Promise<void> {
 		// Flush kernels/traces for both still-running and retained children; the sync
 		// dispose() below only tears them down synchronously.
 		for (const run of [...this._activeRlmChildRuns.values()]) {
@@ -4040,14 +4312,14 @@ export class AgentSession {
 			unsubscribe();
 		}
 		this._rlmChildUnsubscribes.clear();
-		for (const session of this._rlmChildSessions.values()) {
+		for (const { session } of this._rlmChildSessions.values()) {
 			await session.disposeAsync().catch(() => undefined);
 		}
 		this._rlmChildSessions.clear();
 		this._rlmChildCleanupFailures.clear();
 		this._deletedRlmChildIds.clear();
 		try {
-			await this._ipythonKernelProvisioner?.dispose();
+			await this._ipythonKernelProvisioner?.dispose({ snapshot: kernelSnapshot });
 		} catch {
 			// a failed kernel startup already cleaned up after itself
 		}
@@ -4102,7 +4374,7 @@ export class AgentSession {
 				unsubscribe();
 			}
 			this._rlmChildUnsubscribes.clear();
-			for (const session of this._rlmChildSessions.values()) {
+			for (const { session } of this._rlmChildSessions.values()) {
 				session.dispose();
 			}
 			this._rlmChildSessions.clear();
@@ -4259,6 +4531,10 @@ export class AgentSession {
 		return this._rlmDepth;
 	}
 
+	get semanticEdges(): SemanticEdgeRecorder {
+		return this._semanticEdges;
+	}
+
 	get rlmMaxDepth(): number {
 		return this._rlmMaxDepth;
 	}
@@ -4373,8 +4649,7 @@ export class AgentSession {
 			allowRecursion: this._rlmDepth < this._rlmMaxDepth,
 			rlmDepth: this._rlmDepth,
 			rlmParentAgent: this._rlmParentAgent,
-			harnessState: this._loadMergedHarnessState(),
-			genericMcpServers: this._mcpManager?.getEnabledGenericServers(),
+			genericMcpServers: this._mcpManager?.getEnabledPersistentGenericServers(),
 		};
 		return buildSystemPrompt(this._baseSystemPromptOptions);
 	}
@@ -4559,6 +4834,24 @@ export class AgentSession {
 	async acceptAgentMessagePrompt(text: string, options?: PromptOptions): Promise<void> {
 		const customMessage =
 			options?.customMessage && isAgentSessionMessage(options.customMessage) ? options.customMessage : undefined;
+		const clearEpoch = this._agentMessageClearEpoch;
+		const admissionCommitted = () => {
+			options?.admissionCommitted?.();
+			if (clearEpoch !== this._agentMessageClearEpoch) {
+				throw new Error("Agent message was cleared before admission");
+			}
+		};
+		if (
+			this._sessionInputPumpSuspended &&
+			this._isBusyForSessionInput("preflight") &&
+			options?.queueIfBusy === true &&
+			options.streamingBehavior
+		) {
+			admissionCommitted();
+			const queued = await this.queueAgentMessagePrompt(text, options.streamingBehavior, customMessage);
+			options.preflightResult?.(queued, queued);
+			return;
+		}
 		await this._prompt(text, {
 			...options,
 			resumeIfIdle: false,
@@ -4568,6 +4861,7 @@ export class AgentSession {
 			returnAfterAccepted: true,
 			agentMessageId: options?.agentMessageId ?? customMessage?.details.id ?? parseAgentSessionMessagePromptId(text),
 			customMessage,
+			admissionCommitted,
 		});
 		if (customMessage?.details.fromRelationship === "parent") this._repliedToParentSinceTask = false;
 	}
@@ -4596,7 +4890,7 @@ export class AgentSession {
 
 	async promptHeartbeat(job: AgentCronJob, options?: PromptOptions): Promise<void> {
 		const message = createHeartbeatPromptMessage(job);
-		await this._promptInjectedMessage(job.prompt, message, {
+		await this._promptInjectedMessage(message.content, message, {
 			...options,
 			followUpQueueKey: options?.followUpQueueKey ?? `heartbeat:${job.id}`,
 			resumeIfIdle: true,
@@ -4732,6 +5026,37 @@ export class AgentSession {
 		for (const id of ids) this._durableRlmTerminalNoticeActionIds.delete(id);
 	}
 
+	/**
+	 * The kernel read the command's result before the notice reached the model, so
+	 * the notice has nothing left to report: drop it while it is still queued.
+	 * Delivered notices are no longer clearable, which makes this a no-op.
+	 */
+	private _withdrawAsyncBashCompletionNotice(details: { pid: number; command: string }): void {
+		// One read withdraws one notice: pid reuse can queue an identical key twice,
+		// and the read belongs to the older handle, which is the earlier notice.
+		const notice = this._actionStore
+			.clearableActions()
+			.find((action) => this._isAsyncBashCompletionActionFor(action, details));
+		if (!notice) return;
+		this._cancelSessionActions(
+			(action) => action === notice,
+			new Error("Background command completion notice withdrawn: the kernel read the result first."),
+		);
+		this._emitQueueUpdate();
+	}
+
+	private _isAsyncBashCompletionActionFor(
+		action: QueuedSessionAction,
+		details: { pid: number; command: string },
+	): boolean {
+		if (action.payload.kind !== "turn") return false;
+		const message = primaryDeliveryRecord(action).message;
+		if (message.role !== "custom" || message.customType !== ASYNC_BASH_COMPLETION_CUSTOM_TYPE) return false;
+		// pids are reused across handles, so the command has to match too.
+		const completion = message.details as AsyncBashCompletionDetails | undefined;
+		return completion?.pid === details.pid && completion.command === details.command;
+	}
+
 	private async _promptInjectedMessage(
 		text: string,
 		message: CustomMessage,
@@ -4840,6 +5165,10 @@ export class AgentSession {
 					expandPromptTemplates,
 				});
 				const normalized = normalizationResult instanceof Promise ? await normalizationResult : normalizationResult;
+				// Async input handlers ran between the admission check above and
+				// admission itself; re-check so content invalidated during that
+				// await (e.g. a cron job cancelled or updated) is not admitted.
+				if (normalizationResult instanceof Promise) options?.admissionCommitted?.();
 				if (normalized.kind === "extensionCommand") {
 					commitFence?.release();
 					reportPreflight(true);
@@ -5513,7 +5842,9 @@ export class AgentSession {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
 		if (this._sessionInputAdmissionPauses.size > 0) {
-			throw new Error("Cannot admit a session action while session input admission is paused.");
+			throw new SessionInputAdmissionPausedError(
+				"Cannot admit a session action while session input admission is paused.",
+			);
 		}
 		if (this._sessionInputPumpSuspended) {
 			throw new Error("Cannot admit a session action while queued session input is suspended.");
@@ -5537,7 +5868,19 @@ export class AgentSession {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
 		if (this._sessionInputAdmissionPauses.size > 0) {
-			throw new Error("Cannot admit a session action while session input admission is paused.");
+			throw new SessionInputAdmissionPausedError(
+				"Cannot admit a session action while session input admission is paused.",
+			);
+		}
+		if (
+			options.restore !== true &&
+			action.payload.kind === "turn" &&
+			isAgentSessionMessage(primaryDeliveryRecord(action).message)
+		) {
+			assertAgentMessageQueueCapacity(
+				this._actionStore.unfinishedActions().length,
+				DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
+			);
 		}
 		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
 		if (coalescedOwner) {
@@ -5920,8 +6263,14 @@ export class AgentSession {
 		const firstTurn = activeTurns()[0];
 		if (!firstTurn) return;
 		const executionPolicy = firstTurn.payload.executionPolicy;
+		// The digest is never parked as pending context; lazy injection re-arms instead.
+		const parkNextTurnMessages = (messages: CustomMessage[]) => {
+			const parked = messages.filter((message) => message.customType !== HARNESS_DIGEST_CUSTOM_TYPE);
+			if (parked.length !== messages.length) this._harnessDigestPending = true;
+			this._pendingNextTurnMessages.unshift(...parked);
+		};
 		const restoreNextTurnContext = () => {
-			this._pendingNextTurnMessages.unshift(...nextTurnMessages);
+			parkNextTurnMessages(nextTurnMessages);
 			nextTurnMessages = [];
 		};
 		try {
@@ -5987,6 +6336,15 @@ export class AgentSession {
 					if (executionPolicy.nextTurnContextTiming === "commit") {
 						nextTurnMessages = this._takePendingNextTurnMessages();
 					}
+					if (this._harnessDigestPending) {
+						// The first-turn digest rides the turn's delivery records so a
+						// cancelled first turn strips it with the rest of the turn.
+						this._harnessDigestPending = false;
+						const digest = this._harnessDigest();
+						if (this._latestContextHarnessDigest() !== digest) {
+							nextTurnMessages = [createHarnessDigestMessage(digest), ...nextTurnMessages];
+						}
+					}
 					const contextRecords = nextTurnMessages.map((message) =>
 						this._createDeliveryRecord(turns[0].id, "next_turn", message),
 					);
@@ -6032,7 +6390,7 @@ export class AgentSession {
 			this._forgetConsumedPostCompactionContinuations(turns.map((action) => primaryDeliveryRecord(action).message));
 		} catch (error) {
 			const delivered = new Set(this.agent.state.messages);
-			this._pendingNextTurnMessages.unshift(...nextTurnMessages.filter((message) => !delivered.has(message)));
+			parkNextTurnMessages(nextTurnMessages.filter((message) => !delivered.has(message)));
 			for (const action of actions) {
 				if (action.payload.kind === "turn") {
 					action.payload.records = action.payload.records.filter((record) => record.role !== "next_turn");
@@ -6298,7 +6656,24 @@ export class AgentSession {
 		}
 	}
 
+	clearQueuedAgentMessages(): { steering: string[]; followUp: string[] } {
+		this._agentMessageClearEpoch++;
+		// customType identifies agent messages; the text parser covers persisted pre-grammar prompts.
+		return this._clearQueuedTurnActionsMatching(
+			(action) =>
+				isAgentSessionMessage(primaryDeliveryRecord(action).message) ||
+				isAgentSessionMessagePrompt(action.payload.text),
+		);
+	}
+
 	clearQueuedUserMessagesMatching(predicate: (text: string) => boolean): { steering: string[]; followUp: string[] } {
+		return this._clearQueuedTurnActionsMatching((action) => predicate(action.payload.text));
+	}
+
+	private _clearQueuedTurnActionsMatching(matches: (action: QueuedSessionAction) => boolean): {
+		steering: string[];
+		followUp: string[];
+	} {
 		const ownedActions = this._actionStore.ownedActions();
 		const dispatchedTurnCount = ownedActions.filter(
 			(action) =>
@@ -6309,7 +6684,7 @@ export class AgentSession {
 			(action) =>
 				action.payload.kind === "turn" &&
 				action.agentMessageId !== undefined &&
-				predicate(action.payload.text) &&
+				matches(action) &&
 				(action.lifecycle.state === "queued" ||
 					action.lifecycle.state === "selected" ||
 					action.lifecycle.state === "preparing" ||
@@ -6443,6 +6818,7 @@ export class AgentSession {
 
 	get isSessionActive(): boolean {
 		return (
+			this._ipythonKernelProvisioner?.manager?.hasBackgroundWork === true ||
 			this.isStreaming ||
 			this.isCompacting ||
 			this.isRetrying ||
@@ -6581,6 +6957,19 @@ export class AgentSession {
 		const waiters = [...this._sessionInputCheckpointWaiters];
 		this._sessionInputCheckpointWaiters.clear();
 		for (const resolve of waiters) resolve();
+	}
+
+	private _waitForSessionActivityChange(signal: AbortSignal): Promise<void> {
+		return new Promise<void>((resolve) => {
+			const finish = () => {
+				this._sessionInputCheckpointWaiters.delete(finish);
+				signal.removeEventListener("abort", finish);
+				resolve();
+			};
+			this._sessionInputCheckpointWaiters.add(finish);
+			signal.addEventListener("abort", finish, { once: true });
+			if (signal.aborted) finish();
+		});
 	}
 
 	private _observeSessionActionDeferral(action: QueuedSessionAction): {
@@ -6794,10 +7183,29 @@ export class AgentSession {
 	}
 
 	async waitForIdle(): Promise<void> {
-		while (true) {
+		await this._waitForIdleOrSettlement();
+	}
+
+	/**
+	 * {@link waitForIdle} loop; with a settlement, returns once that settlement is
+	 * superseded so a cancelled post-compaction runner cannot keep a checkpoint
+	 * waiter registered (a leaked waiter holds hasPendingAdmissionWaiters true and
+	 * blocks daemon passivation).
+	 */
+	private async _waitForIdleOrSettlement(settlement?: PostCompactionContinuationSettlement): Promise<void> {
+		while (settlement === undefined || this._postCompactionContinuationSettlement === settlement) {
 			if (this._actionStore.queuedActions().length > 0) {
 				if (this._sessionInputPumpSuspended || this._queuedWorkPauses.size > 0) {
-					await new Promise<void>((resolve) => this._sessionInputCheckpointWaiters.add(resolve));
+					let wake = () => {};
+					const changed = new Promise<void>((resolve) => {
+						wake = resolve;
+						this._sessionInputCheckpointWaiters.add(resolve);
+					});
+					try {
+						await (settlement ? Promise.race([changed, settlement.promise]) : changed);
+					} finally {
+						this._sessionInputCheckpointWaiters.delete(wake);
+					}
 					continue;
 				}
 				this._scheduleSessionInputPump();
@@ -6980,11 +7388,22 @@ export class AgentSession {
 	}
 
 	async setModel(model: Model<any>, options: ModelSelectOptions = {}): Promise<void> {
-		if (!this._modelRegistry.hasConfiguredAuth(model)) {
+		// Explicit selection recovers from a stale-auth lockout, but only a fully
+		// validated switch commits the clear (single owner): failed selections never unlock.
+		const staleOnly =
+			!this._modelRegistry.hasConfiguredAuth(model) &&
+			this._modelRegistry.getProviderAuthStatus(model.provider).source === "stale";
+		if (!staleOnly && !this._modelRegistry.hasConfiguredAuth(model)) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
-		if (!(await this._modelRegistry.canUseModel(model))) {
+		if (!(await this._modelRegistry.canUseModel(model, { assumeAuthConfigured: staleOnly }))) {
 			throw new Error(`Model "${model.provider}/${model.id}" is not available for the current Prime team.`);
+		}
+		if (staleOnly) {
+			this._modelRegistry.clearProviderAuthStale(model.provider);
+			if (!this._modelRegistry.hasConfiguredAuth(model)) {
+				throw new Error(`No API key for ${model.provider}/${model.id}`);
+			}
 		}
 
 		const previousModel = this.model;
@@ -7244,9 +7663,9 @@ export class AgentSession {
 				? ` Variables above the per-variable snapshot limit were removed: ${pruned.join(", ")}.`
 				: "";
 		const content = [
-			"<ipython_state>",
+			"[python-state]",
+			"",
 			`Your Python kernel persisted through compaction; its remaining variables, imports, and helpers are still available.${prunedDetail}${detail}`,
-			"</ipython_state>",
 		].join("\n");
 		const message = {
 			role: "custom" as const,
@@ -7269,7 +7688,7 @@ export class AgentSession {
 	}
 
 	private _onIpythonStateRestored(result: RestoreResult): void {
-		const lines = ["<ipython_state_restored>"];
+		const lines = ["[python-state-restored]", ""];
 		if (result.restored.length > 0) {
 			lines.push(
 				`Your Python kernel state was revived from your previous session. These names are available again: ${result.restored.join(", ")}.`,
@@ -7284,7 +7703,6 @@ export class AgentSession {
 				`These could not be restored and must be recreated if needed: ${result.failed.map((f) => f.name).join(", ")}.`,
 			);
 		}
-		lines.push("</ipython_state_restored>");
 		void this.sendCustomMessage(
 			{
 				customType: IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
@@ -7311,10 +7729,12 @@ export class AgentSession {
 			throw new Error("Cannot compact without aborting while the agent is running.");
 		}
 		const hadPostCompactionContinue = this._postCompactionContinuationScheduled;
+		const continueAfterSessionInput = this._postCompactionContinuationSettlement?.continueAfterSessionInput ?? false;
 		this._disconnectFromAgent();
 		if (!options.skipAbort) await this.abort();
 		let didCompact = false;
-		this._compactionAbortController = new AbortController();
+		const compactionAbort = new AbortController();
+		this._compactionAbortController = compactionAbort;
 		let resolveCompactionOperation: () => void = () => {};
 		const compactionOperation = new Promise<void>((resolve) => {
 			resolveCompactionOperation = resolve;
@@ -7331,13 +7751,13 @@ export class AgentSession {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
-			const { apiKey, headers } = await this._getRequiredRequestAuth(this.model);
+			const { apiKey, headers, requestModel } = await this._getRequiredRequestAuth(this.model);
 			const result = await this._performCompaction({
-				model: this.model,
+				model: requestModel,
 				apiKey,
 				headers,
 				customInstructions,
-				signal: this._compactionAbortController.signal,
+				signal: compactionAbort.signal,
 			});
 
 			this._emit({
@@ -7375,16 +7795,25 @@ export class AgentSession {
 				this._compactionOperation = undefined;
 			}
 			resolveCompactionOperation();
+			this._notifySessionInputCheckpointChange();
 			this._scheduleSessionInputPump();
 			if (didCompact) {
 				this._discardPendingAutoRefine({ cancelPostCompactionContinue: true });
+				if (this._goalState.status === "active" && !compactionAbort.signal.aborted) {
+					this._goalContinuationAwaitsRlmWork ||= !this.agent.hasQueuedMessages();
+					this.resumeQueuedWork();
+					if (this.agent.hasQueuedMessages()) this._schedulePostCompactionContinue();
+				}
 				if (hadPostCompactionContinue) {
-					this._schedulePostCompactionContinue();
+					this._schedulePostCompactionContinue(continueAfterSessionInput);
 				}
 				// Queued agent or session-owned inputs resume the loop; defer refine
 				// behind them instead of interleaving it before their turns.
 				this._scheduleAutoRefineAfterCompaction(
-					hadPostCompactionContinue || this.agent.hasQueuedMessages() || this.unfinishedActionCount > 0,
+					this._goalContinuationAwaitsRlmWork ||
+						hadPostCompactionContinue ||
+						this.agent.hasQueuedMessages() ||
+						this.unfinishedActionCount > 0,
 				);
 			}
 		}
@@ -7418,41 +7847,115 @@ export class AgentSession {
 		let extensionCompaction: CompactionResult | undefined;
 		let fromExtension = false;
 
-		if (this._extensionRunner.hasHandlers("session_before_compact")) {
-			const result = (await this._extensionRunner.emit({
-				type: "session_before_compact",
-				preparation,
-				branchEntries: pathEntries,
-				customInstructions,
-				signal,
-			})) as SessionBeforeCompactResult | undefined;
+		const semanticCompaction = this._semanticEdges.beginCompaction();
+		let compactionRecorded = false;
+		const uncommittedSlices: string[] = [];
+		let compactionSettled = false;
+		let summary: string;
+		let firstKeptEntryId: string;
+		let tokensBefore: number;
+		let details: CompactionResult["details"];
+		let usage: CompactionResult["usage"];
+		try {
+			if (this._extensionRunner.hasHandlers("session_before_compact")) {
+				const result = (await this._extensionRunner.emit({
+					type: "session_before_compact",
+					preparation,
+					branchEntries: pathEntries,
+					customInstructions,
+					signal,
+				})) as SessionBeforeCompactResult | undefined;
 
-			if (result?.cancel) {
+				if (result?.cancel) {
+					throw new Error("Compaction cancelled");
+				}
+
+				if (result?.compaction) {
+					extensionCompaction = result.compaction;
+					fromExtension = true;
+				}
+			}
+
+			if (extensionCompaction) {
+				({ summary, firstKeptEntryId, tokensBefore, details, usage } = extensionCompaction);
+			} else {
+				// Each summary wire call gets its own request ID: split turns send two
+				// different bodies, and one Idempotency-Key must never cover both. A slice
+				// that succeeds on the wire stays uncommitted until the compaction itself
+				// commits: a racing sibling's failure (or an abort) must leave no committed
+				// summary request for the next turn's continuation edge to attach to.
+				const summaryCall = async <T>(
+					call: (callHeaders: Record<string, string> | undefined) => Promise<T>,
+				): Promise<T> => {
+					const requestId = this._semanticEdges.startCompactionRequest(semanticCompaction.compactionId);
+					if (requestId === undefined) {
+						return call(headers);
+					}
+					try {
+						const result = await call({ ...headers, ...modelRequestHeaders(requestId) });
+						// A slice resolving after a sibling's rejection already settled the
+						// compaction would push into a drained list and stay in-flight forever.
+						if (compactionSettled) {
+							this._semanticEdges.failRequest(requestId);
+						} else {
+							uncommittedSlices.push(requestId);
+						}
+						return result;
+					} catch (error) {
+						this._semanticEdges.failRequest(requestId);
+						throw error;
+					}
+				};
+				({ summary, firstKeptEntryId, tokensBefore, details, usage } = await compact(
+					preparation,
+					model,
+					apiKey,
+					headers,
+					customInstructions,
+					signal,
+					this.thinkingLevel,
+					summaryCall,
+					providerRetryPolicy(this.settingsManager),
+					this.sessionId,
+				));
+			}
+
+			if (signal.aborted) {
 				throw new Error("Compaction cancelled");
 			}
 
-			if (result?.compaction) {
-				extensionCompaction = result.compaction;
-				fromExtension = true;
+			// Ledger-before-effect: the compaction outcome is durable before the transcript
+			// commits it. Marked first: the ID is consumed even when the write throws, and a
+			// second finish attempt would mask the original I/O error.
+			compactionRecorded = true;
+			compactionSettled = true;
+			for (const requestId of uncommittedSlices.splice(0)) {
+				this._semanticEdges.finishRequest(requestId);
 			}
+			this._semanticEdges.finishCompaction(semanticCompaction.compactionId, "completed");
+			// Attached mechanically; the digest never flows through the summarizer LLM.
+			this.sessionManager.appendCompaction(
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				fromExtension,
+				customInstructions,
+				usage,
+				this._harnessDigest(),
+			);
+		} catch (error) {
+			compactionSettled = true;
+			for (const requestId of uncommittedSlices.splice(0)) {
+				this._semanticEdges.failRequest(requestId);
+			}
+			if (!compactionRecorded) {
+				const cancelled =
+					error instanceof Error && (error.name === "AbortError" || error.message === "Compaction cancelled");
+				this._semanticEdges.finishCompaction(semanticCompaction.compactionId, cancelled ? "cancelled" : "failed");
+			}
+			throw error;
 		}
-
-		const { summary, firstKeptEntryId, tokensBefore, details } =
-			extensionCompaction ??
-			(await compact(preparation, model, apiKey, headers, customInstructions, signal, this.thinkingLevel));
-
-		if (signal.aborted) {
-			throw new Error("Compaction cancelled");
-		}
-
-		this.sessionManager.appendCompaction(
-			summary,
-			firstKeptEntryId,
-			tokensBefore,
-			details,
-			fromExtension,
-			customInstructions,
-		);
 		const newEntries = this.sessionManager.getEntries();
 		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
 		this._mergeUnpersistedOutcomes(this.agent.state.messages);
@@ -7498,20 +8001,17 @@ export class AgentSession {
 	}
 
 	private _settlePostCompactionContinue(error?: Error): void {
-		if (!error && (this._postCompactionContinuationScheduled || this._postCompactionContinuationTimer)) return;
+		if (!error && this._postCompactionContinuationScheduled) return;
 		const settlement = this._postCompactionContinuationSettlement;
 		if (!settlement || settlement.settled) return;
 		settlement.settled = true;
 		this._postCompactionContinuationSettlement = undefined;
 		if (error) settlement.reject(error);
 		else settlement.resolve();
+		this._notifySessionInputCheckpointChange();
 	}
 
 	private _cancelPostCompactionContinue(): void {
-		if (this._postCompactionContinuationTimer) {
-			clearTimeout(this._postCompactionContinuationTimer);
-			this._postCompactionContinuationTimer = undefined;
-		}
 		this._postCompactionContinuationScheduled = false;
 		this._scheduledPostCompactionContinuationMessages = [];
 		this._settlePostCompactionContinue();
@@ -7566,7 +8066,7 @@ export class AgentSession {
 		const pending = this._pendingRequestedRefine;
 		if (!pending) return false;
 		this._pendingRequestedRefine = undefined;
-		void this.refine(pending).catch((error) => this._emitRefineFailed(error));
+		void this.refine(pending, { source: "self" }).catch((error) => this._emitRefineFailed(error));
 		return true;
 	}
 
@@ -7607,75 +8107,126 @@ export class AgentSession {
 		this._scheduleAutoRefine("compact");
 	}
 
-	private _schedulePostCompactionContinue(): void {
-		if (this._postCompactionContinuationScheduled) {
-			return;
-		}
+	private _schedulePostCompactionContinue(continueAfterSessionInput = false): void {
 		if (!this._postCompactionContinuationSettlement || this._postCompactionContinuationSettlement.settled) {
 			this._postCompactionContinuationSettlement = createPostCompactionContinuationSettlement();
 		}
+		const settlement = this._postCompactionContinuationSettlement;
+		settlement.continueAfterSessionInput ||= continueAfterSessionInput;
+		if (this._postCompactionContinuationScheduled) {
+			return;
+		}
 		this._postCompactionContinuationScheduled = true;
 		this._scheduledPostCompactionContinuationMessages = [...this._postCompactionContinuationMessages];
-		this._postCompactionContinuationTimer = setTimeout(() => {
-			this._postCompactionContinuationTimer = undefined;
-			void this._runScheduledPostCompactionContinue()
-				.catch(() => undefined)
-				.finally(() => this._settlePostCompactionContinue());
-		}, 100);
+		void this._runScheduledPostCompactionContinue(settlement)
+			.catch(() => undefined)
+			.finally(() => {
+				if (this._postCompactionContinuationSettlement === settlement) {
+					this._settlePostCompactionContinue();
+				}
+			});
 	}
 
 	private _sessionOwnsScheduledContinuations(continuationMessages: AgentMessage[]): boolean {
 		return continuationMessages.some((message) => this._postCompactionContinuationMessages.includes(message));
 	}
 
-	private async _runScheduledPostCompactionContinue(): Promise<void> {
-		await this._waitForRefineIdle();
-		if (!this._postCompactionContinuationScheduled) {
-			return;
-		}
-		if (this.isStreaming || this.isCompacting || this.isRetrying || this._queuedWorkPauses.size > 0) {
-			this._postCompactionContinuationScheduled = false;
-			this._schedulePostCompactionContinue();
-			return;
-		}
-
-		const continuationMessages = [...this._scheduledPostCompactionContinuationMessages];
-		if (continuationMessages.length > 0 && !this._sessionOwnsScheduledContinuations(continuationMessages)) {
-			this._cancelPostCompactionContinue();
-			this._scheduleAutoRefineAfterAgentEnd();
-			return;
-		}
-		// An empty queue is not idle while the scheduler still owns active work.
-		if (this.unfinishedActionCount > 0 || this._sessionInputPumpRequested) {
-			this._scheduleSessionInputPump();
-			await this._sessionInputPump;
-			if (this._postCompactionContinuationScheduled) {
-				this._postCompactionContinuationScheduled = false;
-				const shouldReschedule =
-					continuationMessages.length === 0
-						? this.unfinishedActionCount > 0
-						: this._sessionOwnsScheduledContinuations(continuationMessages);
-				if (shouldReschedule) {
-					this._schedulePostCompactionContinue();
-				} else {
-					this._scheduledPostCompactionContinuationMessages = [];
-					this._scheduleAutoRefineAfterAgentEnd();
-				}
+	private async _waitForQueuedWorkResume(settlement: PostCompactionContinuationSettlement): Promise<void> {
+		while (this._queuedWorkPauses.size > 0 && this._postCompactionContinuationSettlement === settlement) {
+			let resume = () => {};
+			const resumed = new Promise<void>((resolve) => {
+				resume = resolve;
+				this._sessionInputCheckpointWaiters.add(resolve);
+			});
+			try {
+				await Promise.race([resumed, settlement.promise]);
+			} finally {
+				this._sessionInputCheckpointWaiters.delete(resume);
 			}
-			return;
 		}
+	}
 
-		this._postCompactionContinuationScheduled = false;
-		try {
-			await this.agent.continue();
-			this._forgetConsumedPostCompactionContinuations(continuationMessages);
-		} catch (error) {
-			const code = error instanceof AgentContinueError ? error.code : undefined;
-			if (code === "busy") {
-				this._schedulePostCompactionContinue();
-			} else if (code !== "nothing-to-continue") {
-				// "nothing-to-continue" means the turn already completed; anything else must reject headless idle waiters.
-				this._settlePostCompactionContinue(this._asError(error));
+	private async _runScheduledPostCompactionContinue(settlement: PostCompactionContinuationSettlement): Promise<void> {
+		while (this._postCompactionContinuationScheduled && this._postCompactionContinuationSettlement === settlement) {
+			await this.agent.waitForIdle();
+			await this.waitForRetry();
+			await this._waitForRefineIdle();
+			await this._waitForQueuedWorkResume(settlement);
+			const compactionOperation = this._compactionOperation;
+			if (compactionOperation) {
+				await Promise.race([compactionOperation, settlement.promise]);
+				continue;
+			}
+
+			const commitFence = await this._acquireSessionActionCommitFence();
+			let continuation: Promise<void> | undefined;
+			let continuationMessages: AgentMessage[] = [];
+			let waitForSessionInput = false;
+			try {
+				await this.agent.waitForIdle();
+				if (
+					!this._postCompactionContinuationScheduled ||
+					this._postCompactionContinuationSettlement !== settlement
+				) {
+					return;
+				}
+
+				if (this._queuedWorkPauses.size > 0 || this._compactionOperation || this._refineInFlight) {
+					continue;
+				}
+
+				continuationMessages = [...this._scheduledPostCompactionContinuationMessages];
+				if (continuationMessages.length > 0 && !this._sessionOwnsScheduledContinuations(continuationMessages)) {
+					this._cancelPostCompactionContinue();
+					this._scheduleAutoRefineAfterAgentEnd();
+					return;
+				}
+				if (this.unfinishedActionCount > 0 || this._sessionInputPumpRequested) {
+					this._scheduleSessionInputPump();
+					waitForSessionInput = true;
+				} else {
+					this._postCompactionContinuationScheduled = false;
+					continuation = this.agent.continue();
+				}
+			} finally {
+				commitFence.release();
+			}
+
+			if (waitForSessionInput) {
+				await this._waitForIdleOrSettlement(settlement);
+				if (this._postCompactionContinuationSettlement !== settlement) return;
+				const shouldContinue =
+					(settlement.continueAfterSessionInput && continuationMessages.length === 0) ||
+					this._sessionOwnsScheduledContinuations(continuationMessages);
+				if (shouldContinue) {
+					this._scheduledPostCompactionContinuationMessages = [...this._postCompactionContinuationMessages];
+					continue;
+				}
+				this._postCompactionContinuationScheduled = false;
+				this._scheduledPostCompactionContinuationMessages = [];
+				this._scheduleAutoRefineAfterAgentEnd();
+				return;
+			}
+
+			try {
+				await continuation;
+				if (this._postCompactionContinuationSettlement === settlement) {
+					this._forgetConsumedPostCompactionContinuations(continuationMessages);
+				}
+				return;
+			} catch (error) {
+				const code = error instanceof AgentContinueError ? error.code : undefined;
+				if (code === "busy") {
+					if (this._postCompactionContinuationSettlement === settlement) {
+						this._postCompactionContinuationScheduled = true;
+						this._scheduledPostCompactionContinuationMessages = [...this._postCompactionContinuationMessages];
+					}
+					continue;
+				}
+				if (code !== "nothing-to-continue" && this._postCompactionContinuationSettlement === settlement) {
+					this._settlePostCompactionContinue(this._asError(error));
+				}
+				return;
 			}
 		}
 	}
@@ -7876,18 +8427,79 @@ export class AgentSession {
 		if (!model) {
 			return { shouldRefine: false, rationale: "No model selected." };
 		}
-		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+		const { apiKey, headers, requestModel } = await this._getRequiredRequestAuth(model);
 		return reviewAutoRefine(
 			this.agent.state.messages,
 			this._loadMergedHarnessState(),
 			this._loadRefinementHistory(),
-			model,
+			requestModel,
 			apiKey,
 			context,
 			headers,
 			signal,
 			this.thinkingLevel,
+			providerRetryPolicy(this.settingsManager),
+			this.sessionId,
 		);
+	}
+
+	/** The compact harness digest delivered at cold context boundaries (session start, resume, compaction head). */
+	private _harnessDigest(): string {
+		const tools = this.getActiveToolNames();
+		const hasIpython = tools.includes("ipython");
+		const visibleSkills = this._modelVisibleSkills().filter((skill) => !skill.disableModelInvocation);
+		const hasRefineSkill = visibleSkills.some((skill) => skill.name === REFINE_SKILL_NAME);
+		return formatHarnessStateForPrompt(this._loadMergedHarnessState(), {
+			includeIpythonExamples: hasIpython,
+			includeShellExamples: tools.includes("bash"),
+			includeRefineExamples: hasIpython && hasRefineSkill,
+		});
+	}
+
+	/** Cold-boundary digest delivery: empty contexts defer to the first committed turn (untouched sessions must stay empty); non-empty contexts append only when the newest in-context digest mismatches disk. */
+	private _ensureHarnessDigestContext(): void {
+		if (this.agent.state.messages.length === 0) {
+			this._harnessDigestPending = true;
+			return;
+		}
+		this._harnessDigestPending = false;
+		this._appendHarnessDigestIfStale();
+	}
+
+	private _appendHarnessDigestIfStale(): void {
+		const digest = this._harnessDigest();
+		if (this._latestContextHarnessDigest() === digest) return;
+		const message = createHarnessDigestMessage(digest);
+		try {
+			this.sessionManager.appendCustomMessageEntryWithRollback(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+			);
+		} catch {
+			// Unpersisted session: context-only injection.
+		}
+		this.agent.state.messages.push(message);
+	}
+
+	private _latestContextHarnessDigest(): string | undefined {
+		// Retained pre-compaction messages follow the compaction head, so recency is by timestamp, not position.
+		let latest: { timestamp: number; digest: string } | undefined;
+		for (const message of this.agent.state.messages) {
+			let digest: string | undefined;
+			if (message.role === "custom" && message.customType === HARNESS_DIGEST_CUSTOM_TYPE) {
+				digest = (message.details as HarnessDigestDetails | undefined)?.digest;
+			} else if (message.role === "compactionSummary") {
+				digest = message.harnessDigest;
+			} else {
+				continue;
+			}
+			if (digest !== undefined && (!latest || message.timestamp >= latest.timestamp)) {
+				latest = { timestamp: message.timestamp, digest };
+			}
+		}
+		return latest?.digest;
 	}
 
 	/** Global harness state overlaid with this session's local state, when persisted. */
@@ -7920,7 +8532,7 @@ export class AgentSession {
 			rollbackId?: string;
 			global?: boolean;
 		} = {},
-		internal: { skipAbort?: boolean; trigger?: "manual" | "auto" } = {},
+		internal: { skipAbort?: boolean; trigger?: "manual" | "auto"; source?: RefinementSource } = {},
 	): Promise<RefinementResult> {
 		// Queued /refine executes from the session-input pump between turns;
 		// refine never aborts the agent (planning is backgrounded and the apply
@@ -8013,12 +8625,18 @@ export class AgentSession {
 			if (this._disposed || refineAbort.signal.aborted) {
 				throw new Error("Refinement cancelled because the session was disposed.");
 			}
-			return await this._applyRefine(plan, options, refineAbort);
+			return await this._applyRefine(
+				plan,
+				options,
+				refineAbort,
+				internal.source ?? (internal.trigger === "auto" ? "auto" : "user"),
+			);
 		} finally {
 			resolveApplySettled();
 			if (this._refineInFlight === applySettled) {
 				this._refineInFlight = undefined;
 			}
+			this._notifySessionInputCheckpointChange();
 			this._scheduleSessionInputPump();
 		}
 	}
@@ -8056,8 +8674,7 @@ export class AgentSession {
 			throw new Error(formatNoModelSelectedMessage());
 		}
 
-		const model = this.model;
-		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+		const { apiKey, headers, requestModel: model } = await this._getRequiredRequestAuth(this.model);
 		const globalHarnessStateDir = getGlobalHarnessStateDir();
 		const localHarnessStateDir = this._localHarnessStateDir();
 		const requestedScope = options.global ? "global" : "local";
@@ -8121,10 +8738,11 @@ export class AgentSession {
 			history,
 			model,
 			apiKey,
-			options,
+			{ ...options, retry: providerRetryPolicy(this.settingsManager) },
 			headers,
 			signal,
 			this.thinkingLevel,
+			this.sessionId,
 		);
 		if (this._disposed || signal.aborted) {
 			throw new Error("Refinement cancelled because the session was disposed.");
@@ -8133,7 +8751,16 @@ export class AgentSession {
 	}
 
 	private _recordRefinementOutcome(result: RefinementResult): void {
-		const message = createRefinementOutcomeMessage(result);
+		this._appendDurableRefineMessage(createRefinementOutcomeMessage(result));
+	}
+
+	/** In-context notice for an applied refinement. Refinements with zero applied edits emit nothing. */
+	private _recordRefinementNotice(result: RefinementResult, source: RefinementSource): void {
+		if (!result.appliedEdits.some((edit) => edit.applied)) return;
+		this._appendDurableRefineMessage(createRefinementNoticeMessage(result, source));
+	}
+
+	private _appendDurableRefineMessage(message: CustomMessage): void {
 		try {
 			this.sessionManager.appendCustomMessageEntryWithRollback(
 				message.customType,
@@ -8159,6 +8786,7 @@ export class AgentSession {
 		plan: RefinementPlan,
 		options: { instructions?: string; rollbackId?: string; global?: boolean },
 		refineAbort: AbortController,
+		source: RefinementSource,
 	): Promise<RefinementResult> {
 		if (this._disposed) {
 			throw new Error("Cannot refine a disposed session.");
@@ -8234,8 +8862,8 @@ export class AgentSession {
 				if (!refinementAuditAppendError) throw error;
 			}
 			if (refinementAuditAppendError) throw refinementAuditAppendError.error;
-			this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
-			this.agent.state.systemPrompt = this._baseSystemPrompt;
+			// The prompt stays byte-identical so the provider prefix cache survives; the notice carries the change.
+			this._recordRefinementNotice(result, source);
 			try {
 				this._emit({ type: "refine_complete", result });
 			} catch {
@@ -8489,12 +9117,17 @@ export class AgentSession {
 				(reason === "requested" || reason === "threshold") &&
 				(shouldContinueAfterCompaction || this.agent.hasQueuedMessages() || this.hasPendingSessionWork)
 			) {
-				this._schedulePostCompactionContinue();
+				this._schedulePostCompactionContinue(shouldContinueAfterCompaction);
 			}
 		};
 
 		this._emit({ type: "compaction_start", reason, customInstructions });
 		this._autoCompactionAbortController = new AbortController();
+		let resolveCompactionOperation: () => void = () => {};
+		const compactionOperation = new Promise<void>((resolve) => {
+			resolveCompactionOperation = resolve;
+		});
+		this._compactionOperation = compactionOperation;
 
 		try {
 			const authResult = this.model ? await this._modelRegistry.getApiKeyAndHeaders(this.model) : undefined;
@@ -8515,7 +9148,7 @@ export class AgentSession {
 			}
 
 			const result = await this._performCompaction({
-				model: this.model,
+				model: authResult.requestModel ?? this.model,
 				apiKey: authResult.apiKey,
 				headers: authResult.headers,
 				customInstructions,
@@ -8541,13 +9174,13 @@ export class AgentSession {
 					this.agent.state.messages = messages.slice(0, -1);
 				}
 
-				this._schedulePostCompactionContinue();
+				this._schedulePostCompactionContinue(true);
 				this._scheduleAutoRefineAfterCompaction(willContinueAfterCompaction);
 				return true;
 			} else if (shouldContinueAfterCompaction || hasQueuedMessages) {
 				// Compaction can intentionally stop a tool loop between turns.
 				// Queued follow-up/steering/custom messages can also be waiting.
-				this._schedulePostCompactionContinue();
+				this._schedulePostCompactionContinue(shouldContinueAfterCompaction);
 				this._scheduleAutoRefineAfterCompaction(willContinueAfterCompaction);
 			} else {
 				this._scheduleAutoRefineAfterCompaction(willContinueAfterCompaction);
@@ -8597,6 +9230,11 @@ export class AgentSession {
 			return false;
 		} finally {
 			this._autoCompactionAbortController = undefined;
+			if (this._compactionOperation === compactionOperation) {
+				this._compactionOperation = undefined;
+			}
+			resolveCompactionOperation();
+			this._notifySessionInputCheckpointChange();
 			this._scheduleSessionInputPump();
 		}
 	}
@@ -8705,6 +9343,19 @@ export class AgentSession {
 		this._extensionErrorUnsubscriber = this._extensionErrorListener
 			? runner.onError(this._extensionErrorListener)
 			: undefined;
+	}
+
+	refreshModelMetadata(): void {
+		if (this.model?.provider === "xai") {
+			this.agent.state.model = this._modelRegistry.getModelForCurrentAuth(this.model);
+			this.setThinkingLevel(this.thinkingLevel);
+			this._clampServiceTierForModel();
+		}
+		this._scopedModels = this._scopedModels.map((scoped) =>
+			scoped.model.provider === "xai"
+				? { ...scoped, model: this._modelRegistry.getModelForCurrentAuth(scoped.model) }
+				: scoped,
+		);
 	}
 
 	private _refreshCurrentModelFromRegistry(): void {
@@ -8837,14 +9488,16 @@ export class AgentSession {
 		const previousActiveToolNames = this.getActiveToolNames();
 		const allowedToolNames = this._allowedToolNames;
 		const registeredTools = this._extensionRunner.getAllRegisteredTools();
+		const sdkToolEntry = (definition: ToolDefinition) => ({
+			definition,
+			sourceInfo: createSyntheticSourceInfo(`<sdk:${definition.name}>`, {
+				source: "sdk" as const,
+			}),
+		});
 		const allCustomTools = [
 			...registeredTools,
-			...this._customTools.map((definition) => ({
-				definition,
-				sourceInfo: createSyntheticSourceInfo(`<sdk:${definition.name}>`, {
-					source: "sdk",
-				}),
-			})),
+			...this._customTools.map(sdkToolEntry),
+			...this._acpMcpTools.map(sdkToolEntry),
 		];
 		const isAllowedTool = (name: string): boolean => !allowedToolNames || allowedToolNames.has(name);
 		const allowedCustomTools = allCustomTools.filter((tool) => isAllowedTool(tool.definition.name));
@@ -9006,6 +9659,19 @@ export class AgentSession {
 		this._bindExtensionCore(this._extensionRunner);
 		this._applyExtensionBindings(this._extensionRunner);
 
+		const previousAcpMcpToolNames = new Set(this._acpMcpTools.map((tool) => tool.name));
+		const acpServers = this._mcpManager?.getAcpServers() ?? [];
+		if (acpServers.length > 0 && !this._ipythonKernelProvisioner) {
+			throw new Error("ACP MCP servers require the built-in cpython tool");
+		}
+		const acpMcpTools = this._ipythonKernelProvisioner
+			? createAcpMcpToolDefinitions(acpServers, this._ipythonKernelProvisioner)
+			: [];
+		this._assertAcpMcpToolNamesAvailable(acpMcpTools.map((tool) => tool.name));
+		for (const name of previousAcpMcpToolNames) this._allowedToolNames?.delete(name);
+		for (const tool of acpMcpTools) this._allowedToolNames?.add(tool.name);
+		this._acpMcpTools = acpMcpTools;
+
 		const defaultActiveToolNames = this._baseToolsOverride ? Object.keys(this._baseToolsOverride) : ["ipython"];
 		const baseActiveToolNames = [...(options.activeToolNames ?? defaultActiveToolNames)];
 		if (this._goalState.status === "active" && this._includeGoals) {
@@ -9063,6 +9729,37 @@ export class AgentSession {
 			"rlm.run": createRlmRunHostHandler(async ({ prompt, kwargs, cellSourceCode }) => ({
 				...(await this.runRlmChild(prompt, kwargs, cellSourceCode)),
 			})),
+			"rlm.create_session": createRlmCreateSessionHostHandler(async ({ prompt, kwargs }) => ({
+				...(await this.createRlmSession(prompt, kwargs)),
+			})),
+			"bash.completed": createAsyncBashCompletionHostHandler(async (details) => {
+				const message = createAsyncBashCompletionMessage(details);
+				const disposeSignal = this._sessionActionCommitDisposeAbortController.signal;
+				while (true) {
+					let admissionCommitted = false;
+					try {
+						await this._promptInjectedMessage(message.content, message, {
+							streamingBehavior: "steer",
+							queueIfBusy: true,
+							resumeIfIdle: true,
+							returnAfterAccepted: true,
+							suppressAutonomousContinuation: true,
+							admissionCommitted: () => {
+								admissionCommitted = true;
+							},
+						});
+						return;
+					} catch (error) {
+						if (admissionCommitted || !(error instanceof SessionInputAdmissionPausedError)) throw error;
+						while (this._sessionInputAdmissionPauses.size > 0 && !disposeSignal.aborted) {
+							await this._waitForSessionActivityChange(disposeSignal);
+						}
+					}
+				}
+			}),
+			"bash.consumed": createAsyncBashConsumedHostHandler((details) => {
+				this._withdrawAsyncBashCompletionNotice(details);
+			}),
 			"rlm.find_models": createRlmFindModelsHostHandler((query, limit) => this.findRlmModels(query, limit)),
 			"rlm.list_subagents": createRlmListSubagentsHostHandler(() => this.listRlmSubagents()),
 			"rlm.delete_subagent": createRlmDeleteSubagentHostHandler((target) => this.deleteRlmSubagent(target)),
@@ -9102,12 +9799,16 @@ export class AgentSession {
 				.filter((skill) => !skill.disableModelInvocation)
 				.map((skill) => skill.name),
 		);
-		if (this._agentMessageController && visibleKernelSkillNames.has(AGENT_MESSAGE_SKILL_NAME)) {
+		const messageController = this._agentMessageController;
+		if (messageController && visibleKernelSkillNames.has(AGENT_MESSAGE_SKILL_NAME)) {
 			Object.assign(
 				handlers,
 				createAgentMessageHostHandlers({
-					roster: async () =>
-						(await this.handleAgentMessageHostRequest("agent_message.list_agents")) as AgentFamilyRosterResult,
+					family: async () => {
+						if (!messageController.family)
+							throw new Error("agent family roster is not available in this session");
+						return messageController.family();
+					},
 					awaitPendingChildPublication: (selector) => this._awaitPendingRlmChildPublication(selector),
 					sendAgentMessage: async (input) => {
 						const receipt = (await this.handleAgentMessageHostRequest("agent_message.send", {
@@ -9116,13 +9817,13 @@ export class AgentSession {
 						})) as AgentSessionMessageReceipt;
 						if (this._rlmDepth > 0) {
 							let addressedParent = input.receiverRole === "parent";
-							if (input.receiverRole === undefined && this._agentMessageController?.roster) {
+							if (input.receiverRole === undefined && messageController.family) {
 								try {
-									const roster = await this._agentMessageController.roster();
-									addressedParent = roster.entries.some(
-										(entry) =>
-											entry.relationship === "parent" &&
-											(entry.id === input.target || entry.name === input.target),
+									addressedParent = (await messageController.family()).some(
+										(member) =>
+											member.relationship === "parent" &&
+											(member.entry.id === input.target ||
+												agentFamilyMemberName(member.entry) === input.target),
 									);
 								} catch {
 									addressedParent = false;
@@ -9312,6 +10013,7 @@ export class AgentSession {
 		sessionDir: string;
 		model: Model<any>;
 		thinkingLevel?: ThinkingLevel;
+		spawnedByRequestId?: string;
 	}): CreateRlmSubagentRuntimeOptions {
 		return {
 			parentSession: this,
@@ -9334,6 +10036,7 @@ export class AgentSession {
 			rlmDepth: this._rlmDepth + 1,
 			rlmMaxDepth: this._rlmMaxDepth,
 			rlmParentNodeId: options.id,
+			spawnedByRequestId: options.spawnedByRequestId,
 		};
 	}
 
@@ -9376,7 +10079,6 @@ export class AgentSession {
 			sessionId: childSessionManager.getSessionId(),
 			thinkingBudgets: this.settingsManager.getThinkingBudgets(),
 			transport: this.settingsManager.getTransport(),
-			maxRetryDelayMs: this.settingsManager.getProviderRetrySettings().maxRetryDelayMs,
 			toolExecution: this.agent.toolExecution,
 		});
 
@@ -9399,6 +10101,8 @@ export class AgentSession {
 			rlmSessionDir: options.sessionDir,
 			rlmParentNodeId: options.rlmParentNodeId,
 			rlmParentAgent: options.parentSession.sessionName ?? options.parentSession.sessionId,
+			semanticParentSessionId: options.parentSession.sessionId,
+			semanticSpawnedByRequestId: options.spawnedByRequestId,
 			sessionStartEvent: { type: "session_start", reason: "startup" },
 		});
 		if (child.sessionName !== options.sessionName) {
@@ -9505,7 +10209,7 @@ export class AgentSession {
 			});
 			recorded.add(run.id);
 		}
-		for (const [childId, childSession] of this._rlmChildSessions) {
+		for (const [childId, { session: childSession }] of this._rlmChildSessions) {
 			if (
 				this._deletingRlmChildren.has(childId) ||
 				recorded.has(childId) ||
@@ -9576,41 +10280,31 @@ export class AgentSession {
 		childId: string,
 		isExternallyRunning: () => boolean = () => false,
 	): Promise<"deleted" | "not_found" | "running"> {
-		const isRunning = (): boolean => {
-			const status = this._activeRlmChildRuns.get(childId)?.status;
-			return status === "queued" || status === "running" || isExternallyRunning();
-		};
-		if (isRunning()) {
-			return "running";
-		}
-		const subagent = [...(await this.listRlmSubagents()).subagents, ...this._rlmChildCleanupFailures.values()].find(
-			(entry) => entry.rlm_child_id === childId,
-		);
-		if (!subagent) {
-			for (const run of this._activeRlmChildRuns.values()) {
-				const result = await run.session?.deleteInactiveRlmSubagent(childId, isExternallyRunning);
-				if (result && result !== "not_found") {
-					return result;
-				}
-			}
-			for (const retained of this._rlmChildSessions.values()) {
-				const result = await retained.deleteInactiveRlmSubagent(childId, isExternallyRunning);
-				if (result !== "not_found") {
-					return result;
-				}
-			}
-			return "not_found";
-		}
-		if (isRunning()) {
-			return "running";
-		}
-		const result = await this._trackRlmSubagentDeletion(subagent, () => {
+		for (const owner of this._rlmSubtreeSessions()) {
+			const isRunning = (): boolean => {
+				const status = owner._activeRlmChildRuns.get(childId)?.status;
+				return status === "queued" || status === "running" || isExternallyRunning();
+			};
 			if (isRunning()) {
-				return Promise.resolve({ subagent, outcome: "skipped_running" });
+				return "running";
 			}
-			return this._deleteResolvedRlmSubagent(subagent);
-		});
-		return result.outcome === "skipped_running" ? "running" : "deleted";
+			const subagent = [
+				...(await owner.listRlmSubagents()).subagents,
+				...owner._rlmChildCleanupFailures.values(),
+			].find((entry) => entry.rlm_child_id === childId);
+			if (!subagent) continue;
+			if (isRunning()) {
+				return "running";
+			}
+			const result = await owner._trackRlmSubagentDeletion(subagent, () => {
+				if (isRunning()) {
+					return Promise.resolve({ subagent, outcome: "skipped_running" });
+				}
+				return owner._deleteResolvedRlmSubagent(subagent);
+			});
+			return result.outcome === "skipped_running" ? "running" : "deleted";
+		}
+		return "not_found";
 	}
 
 	async deleteRlmSubagent(target: string): Promise<RlmDeleteSubagentResult> {
@@ -9838,6 +10532,7 @@ export class AgentSession {
 				// resolved child. A failed preflight must leave the prior retry boundary
 				// intact so a later call can acquire it.
 				run.deletionCleanupFailed = false;
+				run.deletionFailureNotice = undefined;
 				run.deletionReservation = createAgentMessageDeferred();
 			}
 			// The detached task remains the sole lifecycle owner. Mark deletion before
@@ -9870,7 +10565,7 @@ export class AgentSession {
 		}
 
 		this._emitRlmSubagentRemoval(subagent);
-		const retained = this._rlmChildSessions.get(childId);
+		const retained = this._rlmChildSessions.get(childId)?.session;
 		try {
 			await this._deleteRlmSubagentSession(childId, retained);
 		} catch (error) {
@@ -9906,7 +10601,7 @@ export class AgentSession {
 			void session.disposeAsync().catch(() => undefined);
 			return false;
 		}
-		this._rlmChildSessions.set(childId, session);
+		this._rlmChildSessions.set(childId, { session, run: this._activeRlmChildRuns.get(childId) });
 		if (unsubscribe) {
 			this._rlmChildUnsubscribes.set(childId, unsubscribe);
 		}
@@ -9917,15 +10612,82 @@ export class AgentSession {
 		const run = this._activeRlmChildRuns.get(childId);
 		if (run?.session === session && run.status === "done") {
 			const unsubscribe = run.unsubscribe ?? noopRlmChildEventUnsubscribe;
-			run.unsubscribe = undefined;
-			this._activeRlmChildRuns.delete(childId);
-			return unsubscribe;
+			return () => {
+				run.unsubscribe = undefined;
+				this._activeRlmChildRuns.delete(childId);
+				unsubscribe();
+			};
 		}
-		if (this._rlmChildSessions.get(childId) !== session) return false;
+		if (this._rlmChildSessions.get(childId)?.session !== session) return false;
 		const unsubscribe = this._rlmChildUnsubscribes.get(childId) ?? noopRlmChildEventUnsubscribe;
-		this._rlmChildUnsubscribes.delete(childId);
-		this._rlmChildSessions.delete(childId);
-		return unsubscribe;
+		return () => {
+			this._rlmChildUnsubscribes.delete(childId);
+			this._rlmChildSessions.delete(childId);
+			unsubscribe();
+		};
+	}
+
+	private _rlmChildSnapshotForRun(
+		run: RlmChildRun,
+		child = run.session ?? this._rlmChildSessions.get(run.id)?.session,
+	): RlmChildAgentSnapshot {
+		const model = child?.model ?? run.model;
+		return {
+			id: run.id,
+			parentId: this._rlmParentNodeId,
+			sessionName: child?.sessionName ?? run.sessionName,
+			model: `${model.provider}/${model.id}`,
+			label: rlmChildLabel(run.prompt),
+			status: run.status,
+			durationMs: run.durationMs,
+			answerPreview: run.answerPreview,
+			toolUseCount: run.toolUseCount > 0 ? run.toolUseCount : undefined,
+			tokenCount: child?._contextTokensForCurrentMessages(),
+			recap: child?.getCurrentRecap(),
+			sessionDir: run.sessionDir,
+			activity: run.activity,
+			repliedSinceTask: child?._repliedToParentSinceTask,
+			error: run.error,
+		};
+	}
+
+	private _rlmChildSnapshotForSession(childId: string, child: AgentSession): RlmChildAgentSnapshot {
+		let answerPreview: string | undefined;
+		let toolUseCount = 0;
+		const messages =
+			child.state.streamingMessage?.role === "assistant"
+				? [...child.messages, child.state.streamingMessage]
+				: child.messages;
+		for (const message of messages) {
+			if (message.role !== "assistant") continue;
+			const text = compactRlmText(readAssistantText(message));
+			if (text) answerPreview = text;
+			toolUseCount += message.content.filter((block) => block.type === "toolCall").length;
+		}
+		return {
+			id: childId,
+			parentId: this._rlmParentNodeId,
+			sessionName: child.sessionName,
+			model: child.model ? `${child.model.provider}/${child.model.id}` : undefined,
+			label: child.sessionName ?? "child agent",
+			status: "done",
+			answerPreview,
+			toolUseCount: toolUseCount > 0 ? toolUseCount : undefined,
+			tokenCount: child._contextTokensForCurrentMessages(),
+			recap: child.getCurrentRecap(),
+			sessionDir: child._rlmSessionDir ?? child.sessionManager.getSessionDir(),
+			// No run exists (e.g. a child rehydrated after daemon recovery), so live
+			// session state is the only source for in-flight follow-up work. Mirror
+			// the run projection's convention: status stays "done" (the recorded task
+			// finished) and current work surfaces through activity.
+			activity: child.isSessionActive ? { kind: child.isStreaming ? "writing" : "waiting" } : undefined,
+			repliedSinceTask: child._repliedToParentSinceTask,
+		};
+	}
+
+	private _isUnboundTerminalRlmChildRun(run: RlmChildRun): boolean {
+		if (run.session !== undefined || this._rlmChildSessions.has(run.id)) return false;
+		return run.status === "done" || run.status === "error" || run.status === "cancelled";
 	}
 
 	/** Live recursive child roster from lifecycle state, including nested work under retained parents. */
@@ -9935,19 +10697,13 @@ export class AgentSession {
 		const traversed = new Set<string>();
 		for (const run of this._activeRlmChildRuns.values()) {
 			const hidden =
-				run.detachedDeletion || this._deletingRlmChildren.has(run.id) || this._deletedRlmChildIds.has(run.id);
+				run.detachedDeletion ||
+				this._deletingRlmChildren.has(run.id) ||
+				this._deletedRlmChildIds.has(run.id) ||
+				this._isUnboundTerminalRlmChildRun(run);
 			const child = run.session;
 			if (!hidden) {
-				const model = child?.model ?? run.model;
-				snapshots.push({
-					id: run.id,
-					parentId: this._rlmParentNodeId,
-					sessionName: child?.sessionName ?? run.sessionName,
-					model: `${model.provider}/${model.id}`,
-					label: rlmChildLabel(run.prompt),
-					status: run.status,
-					sessionDir: run.sessionDir,
-				});
+				snapshots.push(this._rlmChildSnapshotForRun(run));
 				recorded.add(run.id);
 			}
 			if (child) {
@@ -9955,20 +10711,16 @@ export class AgentSession {
 				snapshots.push(...child.getRlmChildSnapshots());
 			}
 		}
-		for (const [childId, child] of this._rlmChildSessions) {
+		for (const [childId, { session: child, run }] of this._rlmChildSessions) {
 			if (recorded.has(childId) || traversed.has(childId)) continue;
 			const hidden = this._deletingRlmChildren.has(childId) || this._deletedRlmChildIds.has(childId);
 			if (!hidden) {
+				const snapshot = run
+					? this._rlmChildSnapshotForRun(run, child)
+					: this._rlmChildSnapshotForSession(childId, child);
 				snapshots.push({
-					id: childId,
-					parentId: this._rlmParentNodeId,
-					sessionName: child.sessionName,
-					model: child.model ? `${child.model.provider}/${child.model.id}` : undefined,
-					label: child.sessionName ?? "child agent",
-					// A failed delete retains the session solely for cleanup retry. Preserve
-					// its cancellation truth in snapshots rather than reviving it as done.
-					status: this._rlmChildCleanupFailures.has(childId) ? "cancelled" : "done",
-					sessionDir: child._rlmSessionDir ?? child.sessionManager.getSessionDir(),
+					...snapshot,
+					status: this._rlmChildCleanupFailures.has(childId) ? "cancelled" : snapshot.status,
 				});
 			}
 			snapshots.push(...child.getRlmChildSnapshots());
@@ -9978,18 +10730,11 @@ export class AgentSession {
 
 	/** True when any direct or nested subagent is still running or queued. */
 	hasRunningRlmChildren(): boolean {
-		for (const run of this._activeRlmChildRuns.values()) {
-			if (run.status === "running" || run.status === "queued") {
-				return true;
-			}
-			if (run.session?.hasRunningRlmChildren()) {
-				return true;
-			}
-		}
-		// A finished direct child can still have a running nested subagent.
-		for (const session of this._rlmChildSessions.values()) {
-			if (session.hasRunningRlmChildren()) {
-				return true;
+		for (const session of this._rlmSubtreeSessions()) {
+			for (const run of session._activeRlmChildRuns.values()) {
+				if (run.status === "running" || run.status === "queued") {
+					return true;
+				}
 			}
 		}
 		return false;
@@ -9997,7 +10742,7 @@ export class AgentSession {
 
 	private _rlmChildSessionSnapshot(): AgentSession[] {
 		const sessions = new Set<AgentSession>();
-		for (const [childId, session] of this._rlmChildSessions) {
+		for (const [childId, { session }] of this._rlmChildSessions) {
 			if (!this._abandonedRlmQuiescenceChildIds.has(childId)) sessions.add(session);
 		}
 		for (const run of this._activeRlmChildRuns.values()) {
@@ -10036,12 +10781,9 @@ export class AgentSession {
 		try {
 			while (true) {
 				await wait(this.waitForHeadlessIdle());
-				// Strong RLM quiescence also owns session-level work (bash, refine,
-				// branch mutation, and manual compaction) that interactive waitForIdle
-				// intentionally ignores. Yield a macrotask while such work is active so
-				// recursive parent/child barriers cannot form a microtask busy-loop.
+				// Strong RLM quiescence also owns work that interactive waitForIdle ignores.
 				if (this.isSessionActive || this._hasDeferredRlmTerminalNotices()) {
-					await wait(new Promise<void>((resolve) => setTimeout(resolve, 0)));
+					await wait(this._waitForSessionActivityChange(cancellation.signal));
 					continue;
 				}
 				const unsettledRuns = [...this._unsettledRlmChildRuns].filter((run) => !run.settled);
@@ -10068,20 +10810,11 @@ export class AgentSession {
 
 	// Inline (non-daemon) mode only; daemon clients attach to the child session directly.
 	getRlmChildSession(childId: string): AgentSession | undefined {
-		const direct = this._activeRlmChildRuns.get(childId)?.session ?? this._rlmChildSessions.get(childId);
-		if (direct) {
-			return direct;
-		}
-		for (const candidate of this._activeRlmChildRuns.values()) {
-			const nested = candidate.session?.getRlmChildSession(childId);
-			if (nested) {
-				return nested;
-			}
-		}
-		for (const retained of this._rlmChildSessions.values()) {
-			const nested = retained.getRlmChildSession(childId);
-			if (nested) {
-				return nested;
+		for (const session of this._rlmSubtreeSessions()) {
+			const direct =
+				session._activeRlmChildRuns.get(childId)?.session ?? session._rlmChildSessions.get(childId)?.session;
+			if (direct) {
+				return direct;
 			}
 		}
 		return undefined;
@@ -10094,26 +10827,61 @@ export class AgentSession {
 	 * was suppressed; false when the id is unknown or the run already settled.
 	 */
 	cancelRlmChildRun(childId: string, reason = "Cancelled by user"): boolean {
-		const run = this._activeRlmChildRuns.get(childId);
-		if (run) {
-			if (run.status !== "running" && run.status !== "queued" && !run.settled) {
-				if (this._sessionInputPumpSuspended) this._abandonRlmRunForQuiescence(run);
-				else run.suppressTerminalNotice = true;
-				return true;
+		for (const session of this._rlmSubtreeSessions()) {
+			const run = session._activeRlmChildRuns.get(childId);
+			if (run) {
+				if (run.status !== "running" && run.status !== "queued" && !run.settled) {
+					if (session._sessionInputPumpSuspended) session._abandonRlmRunForQuiescence(run);
+					else run.suppressTerminalNotice = true;
+					return true;
+				}
+				// The abort cascade never reaches running work retained under a settled descendant.
+				const cancelled = session._cancelRlmChildRun(run, reason);
+				const descendantsCancelled = run.session?.cancelRunningRlmDescendants(reason) ?? false;
+				if (cancelled || descendantsCancelled) {
+					return true;
+				}
 			}
-			return this._cancelRlmChildRun(run, reason);
-		}
-		for (const candidate of this._activeRlmChildRuns.values()) {
-			if (candidate.session?.cancelRlmChildRun(childId, reason)) {
-				return true;
-			}
-		}
-		for (const retained of this._rlmChildSessions.values()) {
-			if (retained.cancelRlmChildRun(childId, reason)) {
+			// A fruitless match keeps walking: child ids are only mkdir-unique among
+			// siblings, so a colliding live run elsewhere must stay reachable.
+			if (session._rlmChildSessions.get(childId)?.session.cancelRunningRlmDescendants(reason)) {
 				return true;
 			}
 		}
 		return false;
+	}
+
+	// A done child sits in BOTH maps until passivation; the visited set keeps that dual membership from doubling the walk.
+	private *_rlmSubtreeSessions(): Generator<AgentSession> {
+		const visited = new Set<AgentSession>([this]);
+		const stack: AgentSession[] = [this];
+		while (stack.length > 0) {
+			const session = stack.pop()!;
+			yield session;
+			for (const run of session._activeRlmChildRuns.values()) {
+				if (run.session && !visited.has(run.session)) {
+					visited.add(run.session);
+					stack.push(run.session);
+				}
+			}
+			for (const { session: retained } of session._rlmChildSessions.values()) {
+				if (!visited.has(retained)) {
+					visited.add(retained);
+					stack.push(retained);
+				}
+			}
+		}
+	}
+
+	/** Cancel every running or queued run in this session's subtree. */
+	cancelRunningRlmDescendants(reason = "Cancelled by user"): boolean {
+		let cancelled = false;
+		for (const session of this._rlmSubtreeSessions()) {
+			for (const run of session._activeRlmChildRuns.values()) {
+				if (session._cancelRlmChildRun(run, reason)) cancelled = true;
+			}
+		}
+		return cancelled;
 	}
 
 	private async _assertRlmSubagentSessionNameAvailable(name: string, ignorePendingReservation = false): Promise<void> {
@@ -10125,7 +10893,7 @@ export class AgentSession {
 			[...this._activeRlmChildRuns.values()].some(
 				(run) => run.session?.sessionName === name || (!run.session && run.sessionName === name),
 			) ||
-			[...this._rlmChildSessions.values()].some((session) => session.sessionName === name) ||
+			[...this._rlmChildSessions.values()].some(({ session }) => session.sessionName === name) ||
 			[...this._rlmChildCleanupFailures.values()].some((entry) => entry.session_name === name);
 		if (localConflict) {
 			throw new Error(formatAgentSessionNameUnavailable(name, depth));
@@ -10170,7 +10938,10 @@ export class AgentSession {
 		};
 	}
 
-	private async _resolveRlmSubagentModel(reference: string | undefined): Promise<RlmSubagentModelSelection> {
+	private async _resolveRlmSubagentModel(
+		reference: string | undefined,
+		target = "subagent",
+	): Promise<RlmSubagentModelSelection> {
 		const parentModel = this.model;
 		if (!parentModel) {
 			throw new Error(formatNoModelSelectedMessage());
@@ -10187,12 +10958,12 @@ export class AgentSession {
 			(candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalizedReference,
 		);
 		if (!model) {
-			throw new Error(`Requested subagent model "${reference}" is unavailable, unauthenticated, or expired`);
+			throw new Error(`Requested ${target} model "${reference}" is unavailable, unauthenticated, or expired`);
 		}
 
 		const auth = await this._modelRegistry.getApiKeyAndHeaders(model);
 		if (!auth.ok) {
-			throw new Error(`Requested subagent model "${reference}" failed authentication preflight`);
+			throw new Error(`Requested ${target} model "${reference}" failed authentication preflight`);
 		}
 		return { model };
 	}
@@ -10202,10 +10973,14 @@ export class AgentSession {
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
 	): Promise<RlmSpawnHandle> {
+		// Snapshot before any await: the spawning request is the turn whose tool call is
+		// executing now. A spawn arriving outside an active run (a detached kernel task
+		// firing while the parent is idle) has no such turn; an absent edge beats a wrong one.
+		const spawnedByRequestId = this.isStreaming ? this._semanticEdges.lastTurnRequestId : undefined;
 		const { name: rawName, model: rawModel, thinking: rawThinking, ...unsupported } = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
 		if (unsupportedKwargs.length > 0) {
-			throw new Error(`Unsupported rlm.run kwargs: ${unsupportedKwargs.sort().join(", ")}`);
+			throw new Error(`Unsupported rlm.spawn kwargs: ${unsupportedKwargs.sort().join(", ")}`);
 		}
 		const requestedSessionName = normalizeRequestedRlmSubagentSessionName(rawName);
 		const requestedModel = normalizeRequestedRlmSubagentModel(rawModel);
@@ -10245,12 +11020,75 @@ export class AgentSession {
 		if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
 		const startedAt = Date.now();
 		const parentAssistantForUsage = this._findLastAssistantMessage();
-		const label = rlmChildLabel(prompt);
-		let answerPreview: string | undefined;
-		let durationMs: number | undefined;
-		let toolUseCount = 0;
+		if (parentAssistantForUsage && !this._rlmDurableParentUsage.has(parentAssistantForUsage)) {
+			this._rlmDurableParentUsage.set(parentAssistantForUsage, cloneUsage(parentAssistantForUsage.usage));
+		}
+		// Child completions accumulate per origin and flush one durable entry per
+		// settle boundary (agent_end, settlement); the staleness checkpoints and
+		// timer bound crash loss to one window of accumulated usage.
+		const pendingChildUsage = new Map<ChildUsageAttributionEntry["origin"], Usage>();
+		let pendingChildUsageSince = 0;
+		let pendingChildUsageTimer: ReturnType<typeof setTimeout> | undefined;
+		let parentEntryDrainScheduled = false;
+		const flushPendingChildUsageAttribution = (afterParentDrain = false) => {
+			if (pendingChildUsageTimer !== undefined) {
+				clearTimeout(pendingChildUsageTimer);
+				pendingChildUsageTimer = undefined;
+			}
+			if (pendingChildUsage.size === 0 || !parentAssistantForUsage) return;
+			const parentEntry = this._findAssistantEntryForMessage(parentAssistantForUsage);
+			if (!parentEntry) {
+				if (!afterParentDrain && !parentEntryDrainScheduled) {
+					parentEntryDrainScheduled = true;
+					const flushAfterParentDrain = () => {
+						parentEntryDrainScheduled = false;
+						flushPendingChildUsageAttribution(true);
+					};
+					// A message_end extension may still be holding the parent assistant before its append.
+					// The parent drain owns this retry; child settlement never waits for that queue.
+					this._agentEventQueue = this._agentEventQueue.then(flushAfterParentDrain, flushAfterParentDrain);
+					this._agentEventQueue.catch(() => {});
+				}
+				return;
+			}
+			const batches = [...pendingChildUsage.entries()];
+			pendingChildUsage.clear();
+			for (const [origin, childUsage] of batches) {
+				const aggregateUsage = cloneUsage(this._rlmDurableParentUsage.get(parentAssistantForUsage)!);
+				attributeChildUsage(aggregateUsage, childUsage);
+				const liveUsage = parentAssistantForUsage.usage;
+				const entryCount = this.sessionManager.getEntries().length;
+				try {
+					this.sessionManager.appendChildUsageAttribution(parentEntry.id, childUsage, aggregateUsage, origin);
+					this._rlmDurableParentUsage.set(parentAssistantForUsage, aggregateUsage);
+				} catch {
+					// Attribution is recoverable bookkeeping; a failed append must not break run settlement.
+				} finally {
+					// The manager updates this same message; retain siblings' still-pending live usage.
+					parentAssistantForUsage.usage = liveUsage;
+					const indexed = this.sessionManager.getEntries()[entryCount];
+					const unindexedUsage = this._rlmUnindexedChildUsage.get(parentAssistantForUsage);
+					// _persist can throw after indexing. That row already participates in live own-usage subtraction.
+					if (
+						indexed?.type === "child_usage_attributed" &&
+						indexed.targetId === parentEntry.id &&
+						unindexedUsage
+					) {
+						subtractAssistantUsage(unindexedUsage, childUsage);
+					}
+					this._ownUsageMemo = undefined;
+				}
+			}
+		};
+		const flushPendingChildUsageIfStale = () => {
+			if (
+				pendingChildUsage.size > 0 &&
+				Date.now() - pendingChildUsageSince >= RLM_CHILD_USAGE_FLUSH_MAX_PENDING_MS
+			) {
+				flushPendingChildUsageAttribution();
+			}
+		};
 		let runningToolCount = 0;
-		let activity: RlmChildAgentActivity | undefined;
 		let childSession: AgentSession | undefined;
 		const run: RlmChildRun = {
 			id: childNodeId,
@@ -10259,6 +11097,7 @@ export class AgentSession {
 			sessionDir: childSessionDir,
 			model: modelSelection.model,
 			status: "queued",
+			toolUseCount: 0,
 			settled: false,
 			abort: noopRlmChildAbort,
 			publication: createAgentMessageDeferred(),
@@ -10271,27 +11110,11 @@ export class AgentSession {
 		this._activeRlmChildRuns.set(run.id, run);
 		this._unsettledRlmChildRuns.add(run);
 		const emitChildUpdate = () => {
-			const childModel = childSession?.model ?? modelSelection.model;
-			this._emit({
-				type: "rlm_child_update",
-				child: {
-					id: childNodeId,
-					parentId: this._rlmParentNodeId,
-					sessionName: childSession?.sessionName ?? sessionName,
-					model: `${childModel.provider}/${childModel.id}`,
-					label,
-					status: run.status,
-					durationMs,
-					answerPreview,
-					toolUseCount: toolUseCount > 0 ? toolUseCount : undefined,
-					tokenCount: childSession?._contextTokensForCurrentMessages(),
-					recap: childSession?.getCurrentRecap(),
-					sessionDir: childSessionDir,
-					activity,
-					repliedSinceTask: childSession?._repliedToParentSinceTask,
-					error: run.error,
-				},
-			});
+			const child = this._rlmChildSnapshotForRun(run);
+			const serialized = JSON.stringify(child);
+			if (serialized === run.lastEmittedUpdate) return;
+			run.lastEmittedUpdate = serialized;
+			this._emit({ type: "rlm_child_update", child });
 		};
 		run.emitUpdate = emitChildUpdate;
 		emitChildUpdate();
@@ -10315,6 +11138,7 @@ export class AgentSession {
 				sessionDir: childSessionDir,
 				model: modelSelection.model,
 				thinkingLevel: requestedThinkingLevel,
+				spawnedByRequestId,
 			}),
 			onSessionPublished: publishChildSession,
 		};
@@ -10344,14 +11168,17 @@ export class AgentSession {
 
 		run.reportDeletionCleanupFailure = (error) => {
 			if (run.suppressTerminalNotice || this._disposed || this._disposing) return Promise.resolve();
+			if (run.deletionFailureNotice) return run.deletionFailureNotice;
 			const cleanupError = error instanceof Error ? error.message : String(error);
-			return deliverTerminalMessageToParent(
+			const notice = deliverTerminalMessageToParent(
 				createRlmChildFailureMessage({
 					childId: run.id,
 					sessionName,
 					error: `Deletion cleanup failed; retry rlm.delete_subagent("${run.id}") before completion: ${cleanupError}`,
 				}),
 			);
+			run.deletionFailureNotice = notice;
+			return notice;
 		};
 
 		// Runtime startup and the task run are deliberately detached. The public
@@ -10374,58 +11201,59 @@ export class AgentSession {
 						return;
 					}
 					if (event.type === "agent_start") {
-						activity = { kind: "waiting" };
+						run.activity = { kind: "waiting" };
 						emitChildUpdate();
 					} else if (event.type === "agent_end") {
-						activity = undefined;
+						flushPendingChildUsageAttribution();
+						run.activity = undefined;
 						emitChildUpdate();
 					} else if (event.type === "message_end" && event.message.role === "assistant") {
 						const assistant = event.message as AssistantMessage;
 						if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted") {
+							// Flush before the fold: a persisted aggregate may only include
+							// completions whose childUsage is durable with or before it.
+							flushPendingChildUsageIfStale();
 							attributeChildUsage(parentAssistantForUsage?.usage ?? emptyUsage(), assistant.usage);
 							if (parentAssistantForUsage) {
-								const parentEntry = this._findAssistantEntryForMessage(parentAssistantForUsage);
-								if (parentEntry) {
-									const messages = child.messages;
-									const assistantIndex = messages.lastIndexOf(assistant);
-									const precedingPrompt = messages
-										.slice(0, assistantIndex)
-										.reverse()
-										.find((message) => message.role === "user" || message.role === "custom");
-									const origin =
-										precedingPrompt?.role === "custom" && isAgentSessionMessage(precedingPrompt)
-											? precedingPrompt.details.id.startsWith("spawn:")
-												? "spawn_task"
-												: "agent_message"
-											: "direct_user";
-									this.sessionManager.appendChildUsageAttribution(
-										parentEntry.id,
-										assistant.usage,
-										parentAssistantForUsage.usage,
-										origin,
+								const unindexedUsage =
+									this._rlmUnindexedChildUsage.get(parentAssistantForUsage) ?? emptyUsage();
+								addAssistantUsage(unindexedUsage, assistant.usage);
+								this._rlmUnindexedChildUsage.set(parentAssistantForUsage, unindexedUsage);
+								this._ownUsageMemo = undefined;
+								const origin = rlmChildUsageOrigin(child.messages, assistant);
+								if (pendingChildUsage.size === 0) {
+									pendingChildUsageSince = Date.now();
+									// Wall-clock backstop for long tool runs without checkpoints.
+									pendingChildUsageTimer = setTimeout(
+										flushPendingChildUsageAttribution,
+										RLM_CHILD_USAGE_FLUSH_MAX_PENDING_MS,
 									);
+									pendingChildUsageTimer.unref?.();
 								}
+								const bucket = pendingChildUsage.get(origin) ?? emptyUsage();
+								addAssistantUsage(bucket, assistant.usage);
+								pendingChildUsage.set(origin, bucket);
 							}
 						}
 						const text = compactRlmText(readAssistantText(assistant));
-						if (text) answerPreview = text;
-						void flushAgentTraceUpload(child.sessionManager).catch(() => undefined);
+						if (text) run.answerPreview = text;
 						emitChildUpdate();
 					} else if (event.type === "message_start" || event.type === "message_update") {
 						if (event.message.role === "assistant") {
 							const text = compactRlmText(readAssistantText(event.message as AssistantMessage));
-							if (text) answerPreview = text;
-							activity = { kind: "writing" };
+							if (text) run.answerPreview = text;
+							run.activity = { kind: "writing" };
 							emitChildUpdate();
 						}
 					} else if (event.type === "tool_execution_start") {
-						toolUseCount += 1;
+						flushPendingChildUsageIfStale();
+						run.toolUseCount += 1;
 						runningToolCount += 1;
-						activity = { kind: "executing", toolName: event.toolName };
+						run.activity = { kind: "executing", toolName: event.toolName };
 						emitChildUpdate();
 					} else if (event.type === "tool_execution_end") {
 						runningToolCount = Math.max(0, runningToolCount - 1);
-						if (runningToolCount === 0) activity = { kind: "waiting" };
+						if (runningToolCount === 0) run.activity = { kind: "waiting" };
 						emitChildUpdate();
 					} else if (event.type === "session_info_changed" || event.type === "recap_update") {
 						emitChildUpdate();
@@ -10460,8 +11288,13 @@ export class AgentSession {
 				await child.waitForRlmQuiescence();
 				if (run.error) throw new Error(run.error);
 				run.status = "done";
-				durationMs = Date.now() - startedAt;
-				activity = undefined;
+				// Only successful completions return; the edge lands on the parent's next commit.
+				const childLastCommitted = child.semanticEdges.lastCommittedRequestId;
+				if (childLastCommitted !== undefined) {
+					this._semanticEdges.recordChildReturned(child.sessionId, childLastCommitted);
+				}
+				run.durationMs = Date.now() - startedAt;
+				run.activity = undefined;
 				emitChildUpdate();
 				if (
 					!run.detachedDeletion &&
@@ -10494,9 +11327,24 @@ export class AgentSession {
 					run.status = "error";
 					run.error = runError.message;
 				}
-				durationMs = Date.now() - startedAt;
-				activity = undefined;
-				emitChildUpdate();
+				// A failed child still returns an error outcome the parent consumes;
+				// cancelled runs and zero-commit children return nothing.
+				const failedChild = childSession ?? childRuntime?.session;
+				const failedLastCommitted = failedChild?.semanticEdges.lastCommittedRequestId;
+				if (run.status === "error" && failedChild && failedLastCommitted !== undefined) {
+					this._semanticEdges.recordChildReturned(failedChild.sessionId, failedLastCommitted);
+				}
+				run.durationMs = Date.now() - startedAt;
+				run.activity = undefined;
+				if (run.status === "error" && childSession === undefined) {
+					// A pre-bind failure leaves no row: "cancelled" is the wire's removal signal.
+					this._emit({
+						type: "rlm_child_update",
+						child: { ...this._rlmChildSnapshotForRun(run), status: "cancelled" },
+					});
+				} else {
+					emitChildUpdate();
+				}
 				if (!run.detachedDeletion && !run.suppressTerminalNotice) {
 					if (run.status === "error") {
 						await deliverTerminalMessageToParent(
@@ -10547,6 +11395,7 @@ export class AgentSession {
 					}
 				}
 			} finally {
+				flushPendingChildUsageAttribution();
 				if (run.detachedDeletion) {
 					run.deletionRunFinished = true;
 					if (!run.settled) {
@@ -10595,6 +11444,64 @@ export class AgentSession {
 		};
 	}
 
+	async createRlmSession(prompt: string, kwargs: Record<string, unknown> = {}): Promise<RlmCreateSessionResult> {
+		const { name: rawName, model: rawModel, thinking: rawThinking, cwd: rawCwd, ...unsupported } = kwargs;
+		const unsupportedKeys = Object.keys(unsupported);
+		if (unsupportedKeys.length > 0) {
+			throw new Error(`Unsupported rlm.create_session kwargs: ${unsupportedKeys.sort().join(", ")}`);
+		}
+		if (!prompt.trim()) {
+			throw new Error("rlm.create_session prompt must not be empty");
+		}
+		if (this._rlmDepth !== 0) {
+			throw new Error("rlm.create_session is available only from a depth-0 session");
+		}
+		if (this._disposed || this._disposing) {
+			throw new Error("Cannot create a top-level session after the current session was disposed");
+		}
+		const host = this._subagentRuntimeHost;
+		if (!host?.createRlmRootSession) {
+			throw new Error("rlm.create_session requires a daemon-backed depth-0 session");
+		}
+
+		const operation = "rlm.create_session";
+		const sessionName = normalizeRequestedRlmSubagentSessionName(rawName, operation);
+		const requestedModel = normalizeRequestedRlmSubagentModel(rawModel, operation);
+		const requestedThinkingLevel = normalizeRequestedRlmSubagentThinkingLevel(rawThinking, operation);
+		if (sessionName) {
+			assertDirectAgentMessageTarget(sessionName);
+			const controller = this._agentMessageController;
+			if (controller?.assertSessionNameAvailable) {
+				await controller.assertSessionNameAvailable({ name: sessionName, depth: 0 });
+			}
+		}
+		if (rawCwd !== undefined && (typeof rawCwd !== "string" || !rawCwd.trim())) {
+			throw new Error("rlm.create_session cwd must be a non-empty string");
+		}
+		const cwd = rawCwd === undefined ? this._cwd : resolve(this._cwd, rawCwd.trim());
+		const modelSelection = await this._resolveRlmSubagentModel(requestedModel, "top-level session");
+		if (requestedThinkingLevel !== undefined) {
+			const supported = getSupportedThinkingLevels(modelSelection.model) as ThinkingLevel[];
+			if (!supported.includes(requestedThinkingLevel)) {
+				throw new Error(
+					`Requested thinking level "${requestedThinkingLevel}" is not supported by model "${modelSelection.model.provider}/${modelSelection.model.id}"; supported levels: ${supported.join(", ")}`,
+				);
+			}
+		}
+		const thinkingLevel =
+			requestedThinkingLevel ?? (clampThinkingLevel(modelSelection.model, this.thinkingLevel) as ThinkingLevel);
+		if (this._disposed || this._disposing) {
+			throw new Error("Cannot create a top-level session after the current session was disposed");
+		}
+		return host.createRlmRootSession({
+			prompt,
+			sessionName,
+			cwd,
+			model: modelSelection.model,
+			thinkingLevel,
+		});
+	}
+
 	async runRlmChild(
 		prompt: string,
 		kwargs: Record<string, unknown> = {},
@@ -10625,74 +11532,25 @@ export class AgentSession {
 	}
 
 	private _isFauxProviderQueueExhausted(message: AssistantMessage): boolean {
-		return message.provider === "faux" && message.errorMessage === "No more faux responses queued";
+		return isFauxProviderQueueExhausted(message);
 	}
 
 	private _isAgentLifecycleFailure(message: AssistantMessage): boolean {
-		return message.diagnostics?.some((diagnostic) => diagnostic.type === "agent_lifecycle_failure") ?? false;
-	}
-
-	private _getProviderStreamFailureDetails(message: AssistantMessage): Record<string, unknown> | undefined {
-		const failure = message.diagnostics?.find((diagnostic) => diagnostic.type === "provider_stream_failure");
-		const details = failure?.details;
-		if (!details || typeof details !== "object") {
-			return undefined;
-		}
-		return details;
+		return isAgentLifecycleFailure(message);
 	}
 
 	private _getProviderStreamFailureKind(message: AssistantMessage): string | undefined {
-		const kind = this._getProviderStreamFailureDetails(message)?.kind;
-		return typeof kind === "string" ? kind : undefined;
-	}
-
-	private _isStructuredPermanentProviderFailure(message: AssistantMessage): boolean {
-		const kind = this._getProviderStreamFailureKind(message);
-		return kind === "auth" || kind === "invalid_request" || kind === "refusal";
+		return providerStreamFailureKind(message);
 	}
 
 	private _isStructuredPermanentProviderRetryExhausted(message: AssistantMessage): boolean {
-		return this._retryAttempt > 0 && this._isStructuredPermanentProviderFailure(message);
-	}
-
-	private _getProviderStreamFailureAuthStatus(message: AssistantMessage): number | undefined {
-		const details = this._getProviderStreamFailureDetails(message);
-		if (!details) {
-			return undefined;
-		}
-
-		const kind = details.kind;
-		if (kind !== "auth") {
-			return undefined;
-		}
-
-		const status = details.status;
-		if (typeof status === "number") {
-			return status;
-		}
-		if (typeof status === "string") {
-			const parsed = Number(status);
-			return Number.isInteger(parsed) ? parsed : undefined;
-		}
-		return undefined;
+		return isPermanentProviderFailureKind(this._getProviderStreamFailureKind(message), this._retryAttempt);
 	}
 
 	private _isConcreteProviderAuthFailure(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || !message.errorMessage) return false;
-
-		const structuredStatus = this._getProviderStreamFailureAuthStatus(message);
-		if (structuredStatus === 401 || structuredStatus === 403) {
-			return true;
-		}
-
-		if (/\b(?:401|403)\b/.test(message.errorMessage) && /\bstatus code\b/i.test(message.errorMessage)) {
-			return true;
-		}
-
-		return (
-			/\b(?:401|403)\b/.test(message.errorMessage) &&
-			/auth|unauthori[sz]ed|forbidden|api.?key|token|credential/i.test(message.errorMessage)
-		);
+		// Only the provider's structured classification counts as an auth failure.
+		return this._getProviderStreamFailureKind(message) === "auth";
 	}
 
 	private _captureRetryAuthFailureSource(message: AssistantMessage): AuthSourceToken | undefined {
@@ -10807,7 +11665,32 @@ export class AgentSession {
 			return false;
 		}
 
-		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
+		// Server-requested waits are honored, capped by retry.provider.maxRetryDelayMs (0 disables).
+		const maxRetryDelayMs = this.settingsManager.getProviderRetrySettings().maxRetryDelayMs;
+		const delay = providerRetryDelay(this._retryAttempt, providerStreamFailureRetryAfterMs(message), {
+			baseDelayMs: settings.baseDelayMs,
+			maxRetryDelayMs,
+		});
+		if (delay.kind === "exceeds-cap") {
+			this._markProviderAuthStaleForRetryFailure(message, options);
+			this._emit({
+				type: "auto_retry_end",
+				success: false,
+				attempt: this._retryAttempt - 1,
+				finalError: `Provider requested a ${Math.ceil(delay.retryAfterMs / 1000)}s wait before retrying (above retry.provider.maxRetryDelayMs=${maxRetryDelayMs}ms): ${message.errorMessage || "unknown error"}`,
+			});
+			this._retryAttempt = 0;
+			this._retryAuthFailureSources = [];
+			this._resolveRetry();
+			return false;
+		}
+
+		const delayMs = delay.delayMs;
+		// Park now: the retry re-issues the failed call and must reuse its Idempotency-Key.
+		// Payload hooks mutate the wire body after the hash point, so reuse is forfeited.
+		if (!this._extensionRunner.hasHandlers("before_provider_request")) {
+			this._semanticEdges.prepareTurnRetry();
+		}
 
 		this._emit({
 			type: "auto_retry_start",
@@ -10842,8 +11725,24 @@ export class AgentSession {
 		}
 		this._retryAbortController = undefined;
 
+		const retryGeneration = this._retryGeneration;
 		setTimeout(() => {
-			this.agent.continue().catch(() => {});
+			this.agent.continue().catch((error: unknown) => {
+				// A continue that never starts must still resolve the retry (else isRetrying
+				// sticks forever) — unless a newer retry owns the state by now.
+				if (this._retryGeneration !== retryGeneration || !this.isRetrying) return;
+				this._markProviderAuthStaleForRetryFailure(message, options);
+				const attempt = this._retryAttempt;
+				this._retryAttempt = 0;
+				this._retryAuthFailureSources = [];
+				this._emit({
+					type: "auto_retry_end",
+					success: false,
+					attempt,
+					finalError: error instanceof Error ? error.message : String(error),
+				});
+				this._resolveRetry();
+			});
 		}, 0);
 
 		return true;
@@ -10918,7 +11817,9 @@ export class AgentSession {
 			transient?: boolean;
 		},
 	): Promise<BashResult> {
-		this._bashAbortController = new AbortController();
+		// Each invocation owns its controller so abortBash reaches every in-flight command.
+		const abortController = new AbortController();
+		this._bashAbortControllers.add(abortController);
 
 		const prefix = this.settingsManager.getShellCommandPrefix();
 		const shellPath = this.settingsManager.getShellPath();
@@ -10931,7 +11832,7 @@ export class AgentSession {
 				options?.operations ?? createLocalBashOperations({ shellPath }),
 				{
 					onChunk,
-					signal: this._bashAbortController.signal,
+					signal: abortController.signal,
 				},
 			);
 
@@ -10940,7 +11841,8 @@ export class AgentSession {
 			}
 			return result;
 		} finally {
-			this._bashAbortController = undefined;
+			this._bashAbortControllers.delete(abortController);
+			this._notifySessionInputCheckpointChange();
 		}
 	}
 
@@ -10985,6 +11887,7 @@ export class AgentSession {
 			);
 		} finally {
 			this._userBashRunning = false;
+			this._notifySessionInputCheckpointChange();
 		}
 		// Emitted after the slot is released so clients never observe a bash_end
 		// while the session still rejects new commands as already running.
@@ -11109,14 +12012,17 @@ export class AgentSession {
 	abortBash(): void {
 		// A user bash command may not have spawned yet (extension dispatch in
 		// progress); flag the request so runUserBash cancels before executing.
-		if (this._userBashRunning && this._bashAbortController === undefined) {
+		// runUserBash clears the flag at each start, so a stale flag is harmless.
+		if (this._userBashRunning) {
 			this._userBashAbortRequested = true;
 		}
-		this._bashAbortController?.abort();
+		for (const controller of this._bashAbortControllers) {
+			controller.abort();
+		}
 	}
 
 	get isBashRunning(): boolean {
-		return this._bashAbortController !== undefined || this._userBashRunning;
+		return this._bashAbortControllers.size > 0 || this._userBashRunning;
 	}
 
 	/** Whether there are pending bash messages waiting to be flushed */
@@ -11350,18 +12256,20 @@ export class AgentSession {
 
 			let summaryText: string | undefined;
 			let summaryDetails: unknown;
+			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
-				const model = this.model!;
-				const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+				const { apiKey, headers, requestModel: model } = await this._getRequiredRequestAuth(this.model!);
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
 				const result = await generateBranchSummary(entriesToSummarize, {
 					model,
 					apiKey,
 					headers,
 					signal: this._branchSummaryAbortController.signal,
+					sessionId: this.sessionId,
 					customInstructions,
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
+					retry: providerRetryPolicy(this.settingsManager),
 				});
 				if (result.aborted) {
 					return { cancelled: true, aborted: true };
@@ -11370,6 +12278,7 @@ export class AgentSession {
 					throw new Error(result.error);
 				}
 				summaryText = result.summary;
+				summaryUsage = result.usage;
 				summaryDetails = {
 					readFiles: result.readFiles || [],
 					modifiedFiles: result.modifiedFiles || [],
@@ -11405,6 +12314,7 @@ export class AgentSession {
 					summaryText,
 					summaryDetails,
 					fromExtension,
+					summaryUsage,
 				);
 				summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
 
@@ -11425,6 +12335,8 @@ export class AgentSession {
 			this.agent.state.messages = sessionContext.messages;
 			this._mergeUnpersistedOutcomes(this.agent.state.messages);
 			this._restoreLateIpythonSentAgentMessages();
+			// Context rebuild = cold boundary: refresh the digest like resume.
+			this._ensureHarnessDigestContext();
 			this._reloadGoalStateFromBranch();
 			this._reloadRlmMaxDepthFromBranch();
 			this._invalidateQueuedPromptPreparation();
@@ -11444,6 +12356,7 @@ export class AgentSession {
 				this._branchSummaryOperation = undefined;
 			}
 			resolveBranchSummaryOperation();
+			this._notifySessionInputCheckpointChange();
 		}
 	}
 
@@ -11574,6 +12487,31 @@ export class AgentSession {
 		return (provider, modelId) => this._modelRegistry.find(provider, modelId)?.contextWindow;
 	}
 
+	private _subtractUnindexedChildUsage(ownUsage: Usage, entries: SessionEntry[]): void {
+		for (const entry of entries) {
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			const unindexedUsage = this._rlmUnindexedChildUsage.get(entry.message);
+			if (unindexedUsage) subtractAssistantUsage(ownUsage, unindexedUsage);
+		}
+	}
+
+	private _ownUsageMemo?: { count: number; tailId: string | undefined; usage: SessionUsageSummary | undefined };
+
+	// Whole-file own spend, identical to the catalog scan so rows never shift at passivation.
+	getOwnUsageSummary(): SessionUsageSummary | undefined {
+		const entries = this.sessionManager.getEntries();
+		const tailId = entries.at(-1)?.id;
+		const memo = this._ownUsageMemo;
+		if (memo && memo.count === entries.length && memo.tailId === tailId) {
+			return memo.usage;
+		}
+		const { ownUsage } = computeOwnAndTotalUsage(entries, entries);
+		this._subtractUnindexedChildUsage(ownUsage, entries);
+		const usage = sessionUsageSummaryFrom(ownUsage);
+		this._ownUsageMemo = { count: entries.length, tailId, usage };
+		return usage;
+	}
+
 	/**
 	 * Build the agent context overview for /context: this session as the root
 	 * plus one node per RLM sub-agent, recursively. Running children are read
@@ -11582,10 +12520,9 @@ export class AgentSession {
 	 */
 	getContextTree(): ContextTreeNode {
 		const resolveContextWindow = this._contextWindowResolver();
-		const { ownUsage, totalUsage } = computeOwnAndTotalUsage(
-			this.sessionManager.getBranch(),
-			this.sessionManager.getEntries(),
-		);
+		const branch = this.sessionManager.getBranch();
+		const { ownUsage, totalUsage } = computeOwnAndTotalUsage(branch, this.sessionManager.getEntries());
+		this._subtractUnindexedChildUsage(ownUsage, branch);
 
 		const children: ContextTreeNode[] = [];
 		const liveIds = new Set<string>();

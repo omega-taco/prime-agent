@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import functools
 import json
 import os
+import secrets
 import selectors
 import shutil
 import signal
@@ -35,15 +37,137 @@ _READ_CHUNK = 65536
 # Fixed child-side fd for the status channel; POSIX shells (notably dash) only
 # guarantee single-digit fds in redirection syntax.
 _STATUS_FD = 9
+_OUTPUT_FD = 8
+_COMPLETION_PREFIX = b"\x1eprime-agent-complete:"
+_COMPLETION_SUFFIX = b"\x1f"
 # Cancelled one-shot awaits: TERM grace before the group KILL, then the bounded
 # wait for a confirmed group exit before CancelledError propagates.
 _CANCEL_TERM_GRACE = 0.5
 _CANCEL_KILL_WAIT = 2.0
+_COMPLETION_NOTICE_COMMAND_CAP = 1000
+_ASYNCIO_WRAPPER_CALLBACKS = {
+    ("asyncio.tasks", "gather.<locals>._done_callback"),
+    ("asyncio.tasks", "shield.<locals>._inner_done_callback"),
+    ("asyncio.tasks", "_wait.<locals>._on_completion"),
+    ("asyncio.tasks", "as_completed.<locals>._on_completion"),
+    ("asyncio.tasks", "_release_waiter"),
+}
 
 _live_handles: set["BashHandle"] = set()
 _live_lock = threading.Lock()
 _hook_installed = False
 _hook_lock = threading.Lock()
+
+
+def _current_cell_completion_context() -> tuple[asyncio.Event, asyncio.Task[Any] | None] | None:
+    """Get the creating REPL cell's lifecycle without coupling standalone use to repl."""
+    try:
+        from . import repl
+
+        if repl.is_active():
+            return repl.current_cell_completion_context()
+    except (ImportError, RuntimeError):
+        pass
+    return None
+
+
+def _consume_notice_task(task: asyncio.Task[None]) -> None:
+    """Retrieve detached notifier failures so they never become loop warnings."""
+    if not task.cancelled():
+        task.exception()
+
+
+def _completion_reaches(
+    start: asyncio.Future[Any], targets: tuple[asyncio.Future[Any], ...]
+) -> bool:
+    """Follow asyncio's wrapper and TaskGroup ownership callbacks."""
+    pending = [start]
+    seen_futures: set[int] = set()
+    seen_values: set[int] = set()
+
+    def collect(value: Any, depth: int = 0) -> None:
+        if isinstance(value, asyncio.Future):
+            pending.append(value)
+            return
+        identity = id(value)
+        if depth >= 4 or identity in seen_values:
+            return
+        seen_values.add(identity)
+
+        nested: list[Any] = []
+        if isinstance(value, asyncio.Queue):
+            pending.extend(value._getters)
+        elif isinstance(value, functools.partial):
+            nested.extend((value.func, value.args, value.keywords))
+        elif isinstance(value, dict):
+            nested.extend(value.keys())
+            nested.extend(value.values())
+        elif isinstance(value, (tuple, list, set, frozenset)):
+            nested.extend(value)
+        else:
+            closure = getattr(value, "__closure__", None) or ()
+            for cell in closure:
+                try:
+                    nested.append(cell.cell_contents)
+                except ValueError:
+                    pass
+            bound_self = getattr(value, "__self__", None)
+            if bound_self is not None:
+                nested.append(bound_self)
+        for item in nested:
+            collect(item, depth + 1)
+
+    while pending:
+        future = pending.pop()
+        if any(future is target for target in targets):
+            return True
+        if id(future) in seen_futures:
+            continue
+        seen_futures.add(id(future))
+        for entry in getattr(future, "_callbacks", None) or ():
+            callback = entry[0] if isinstance(entry, tuple) else entry
+            base = callback.func if isinstance(callback, functools.partial) else callback
+            identity = (getattr(base, "__module__", None), getattr(base, "__qualname__", None))
+            if identity in _ASYNCIO_WRAPPER_CALLBACKS:
+                collect(callback)
+            elif identity == ("asyncio.tasks", "_AsCompletedIterator._handle_completion"):
+                collect(base.__self__._done)
+            elif identity == (None, "Task.task_wakeup"):
+                task = getattr(callback, "__self__", None)
+                if isinstance(task, asyncio.Task):
+                    pending.append(task)
+            elif identity == ("asyncio.taskgroups", "TaskGroup._on_task_done"):
+                parent = getattr(getattr(callback, "__self__", None), "_parent_task", None)
+                if isinstance(parent, asyncio.Future):
+                    pending.append(parent)
+    return False
+
+
+def _creating_cell_waits_for(
+    owner: asyncio.Task[Any] | None, awaiter: asyncio.Task[Any] | None
+) -> bool:
+    """Return whether the cell owner directly or transitively waits for awaiter."""
+    if owner is None or awaiter is None:
+        return False
+    if owner is awaiter:
+        return True
+    waiter = getattr(owner, "_fut_waiter", None)
+    targets: tuple[asyncio.Future[Any], ...] = (owner,)
+    if isinstance(waiter, asyncio.Future):
+        targets += (waiter,)
+    return _completion_reaches(awaiter, targets)
+
+
+def _live_cell_owner() -> asyncio.Task[Any] | None:
+    """Body task of the cell executing right now, ignoring detached context copies."""
+    try:
+        from . import repl
+
+        if repl.is_active():
+            return repl.active_cell_task()
+    except (ImportError, RuntimeError):
+        pass
+    return None
 
 
 @dataclass(frozen=True)
@@ -113,14 +237,25 @@ class BashHandle:
 
     def __init__(self, command: str) -> None:
         self.command = command
+        completion_context = _current_cell_completion_context()
+        self._creating_cell_finished = completion_context[0] if completion_context else None
+        self._creating_cell_task = completion_context[1] if completion_context else None
+        self._awaited_by_creating_cell = False
         self._buffer = _BoundedBuffer()
         self._done = threading.Event()
         self._eof = threading.Event()
+        self._completion_terminal = threading.Event()
+        self._completion_output: str | None = None
+        self._completion_lock = threading.Lock()
+        self._completion_pending = b""
         self._status: int | None = None
         self._status_known = threading.Event()
         self._reaped = False
         self._result: BashResult | None = None
         self._callbacks: list[Callable[[], None]] = []
+        self._reap_callback: Callable[[], None] | None = None
+        self._result_consumed = False
+        self._consumed_notice: Callable[[], None] | None = None
         self._callback_lock = threading.Lock()
         # Serializes kill/reap so a pid fallback can never outlive the process handle.
         self._kill_lock = threading.Lock()
@@ -133,6 +268,7 @@ class BashHandle:
         # True only while the pump moves a chunk from the pipe into the buffer.
         self._pump_transfer = False
         self._job: int | None = None
+        self._completion_marker: bytes | None = None
         status_write = -1
         if _IS_POSIX:
             # Full-duplex status channel: the child end rides in as stdin (fd 0)
@@ -150,9 +286,19 @@ class BashHandle:
                 os.close(self._status_read)
                 os.close(status_write)
                 raise
-            script = _status_script(_with_prefix(command))
+            completion_token = secrets.token_hex(32)
+            # Halves stop passive echoes; a deliberate forgery freezes only this call while later bytes stay live.
+            token_midpoint = len(completion_token) // 2
+            self._completion_marker = (
+                _COMPLETION_PREFIX + completion_token.encode("ascii") + _COMPLETION_SUFFIX
+            )
+            script = _status_script(
+                _with_prefix(command),
+                completion_token[:token_midpoint],
+                completion_token[token_midpoint:],
+            )
         else:
-            # Windows: the child is created suspended, atomically inside the kill-on-close job.
+            # Windows lacks a foreground-status channel, so its exit drain stays best-effort.
             script = _with_prefix(command)
             self._job = _winjob.create_job()
             if self._job is None:
@@ -216,6 +362,7 @@ class BashHandle:
         threading.Thread(target=self._pump, daemon=True).start()
         threading.Thread(target=self._report, daemon=True).start()
         threading.Thread(target=self._watch, daemon=True).start()
+        self._schedule_background_completion_notice()
 
     @property
     def pid(self) -> int:
@@ -231,14 +378,17 @@ class BashHandle:
 
     def output(self) -> str:
         self._released = True
+        self._note_result_consumed()
         return self._buffer.text()
 
     def tail(self, n: int = 50) -> str:
         self._released = True
+        self._note_result_consumed()
         return "\n".join(self._buffer.text().splitlines()[-n:])
 
     def poll(self) -> BashResult | None:
         self._released = True
+        self._note_result_consumed()
         return self._result if self._done.is_set() else None
 
     def kill(self, sig: int = signal.SIGTERM, grace: float = 5.0) -> None:
@@ -274,8 +424,6 @@ class BashHandle:
         stdout = self._proc.stdout
         assert stdout is not None
         if not _IS_POSIX:
-            # Windows: no FIONREAD fence; the drain keeps its quiescence
-            # heuristic (best-effort parity).
             try:
                 while chunk := stdout.read1(_READ_CHUNK):
                     self._buffer.write(chunk)
@@ -284,9 +432,6 @@ class BashHandle:
             stdout.close()
             self._eof.set()
             return
-        # POSIX: select-gate the read and flag the read->commit window, so the
-        # drain fence never sees "pipe empty + buffer quiescent" while a chunk
-        # is in flight between the pipe read and the buffer commit.
         fd = stdout.fileno()
         try:
             with selectors.DefaultSelector() as sel:
@@ -298,16 +443,53 @@ class BashHandle:
                         chunk = os.read(fd, _READ_CHUNK)
                         if not chunk:
                             break
-                        self._buffer.write(chunk)
+                        self._consume_output(chunk)
                     finally:
                         self._pump_transfer = False
         except (OSError, ValueError):
             pass
+        self._abandon_completion()
         try:
             stdout.close()
         except OSError:
             pass
         self._eof.set()
+
+    def _consume_output(self, chunk: bytes) -> None:
+        marker = self._completion_marker
+        assert marker is not None
+        with self._completion_lock:
+            if self._completion_terminal.is_set():
+                self._buffer.write(chunk)
+                return
+            data = self._completion_pending + chunk
+            marker_at = data.find(marker)
+            if marker_at >= 0:
+                self._buffer.write(data[:marker_at])
+                self._completion_pending = b""
+                self._completion_output = self._buffer.text()
+                self._completion_terminal.set()
+                self._buffer.write(data[marker_at + len(marker) :])
+                return
+            retained = 0
+            for size in range(min(len(data), len(marker) - 1), 0, -1):
+                if data.endswith(marker[:size]):
+                    retained = size
+                    break
+            self._buffer.write(data[:-retained] if retained else data)
+            self._completion_pending = data[-retained:] if retained else b""
+
+    def _abandon_completion(self) -> None:
+        with self._completion_lock:
+            if self._completion_terminal.is_set():
+                return
+            self._buffer.write(self._completion_pending)
+            self._completion_pending = b""
+            self._completion_terminal.set()
+
+    def _wait_for_completion(self) -> str | None:
+        self._completion_terminal.wait()
+        return self._completion_output
 
     def _report(self) -> None:
         # Finalize at foreground completion (status channel), not EOF, so
@@ -325,8 +507,10 @@ class BashHandle:
             # (parsed status, EOF, garbage, exception) must set it.
             self._status_known.set()
         if status is not None:
-            self._drain_grace()
-            self._finalize(status)
+            output = self._wait_for_completion()
+            if output is None:
+                self._drain_grace()
+            self._finalize(status, output)
 
     def _watch(self) -> None:
         # Observe shell death independently of the status socket: an early
@@ -347,6 +531,7 @@ class BashHandle:
         with self._callback_lock:
             delivered = self._status
         if delivered is None and not self._done.is_set():
+            self._abandon_completion()
             self._drain_grace()
             self._finalize(exit_code)
         with self._kill_lock:
@@ -355,6 +540,10 @@ class BashHandle:
             if not _IS_POSIX:
                 # Reaped: pid fallbacks are gone, so the handle may finally close.
                 cast("_winjob.JobProcess", self._proc).close()
+        with self._callback_lock:
+            callback, self._reap_callback = self._reap_callback, None
+        if callback is not None:
+            callback()
         if delivered:
             _record_journal(self._pid, active=False)
         with _live_lock:
@@ -409,10 +598,7 @@ class BashHandle:
             os.close(self._wake_read)
 
     def _drain_grace(self) -> None:
-        # Bounded wait so the result includes foreground output still in the pipe:
-        # EOF arrives immediately without background jobs, otherwise stop once the
-        # buffer is quiescent for one tick AND the pipe holds no unread bytes (a
-        # slow pump must not lose output the shell wrote before its status).
+        # Best-effort fallback when process exit/EOF arrives without a sentinel.
         deadline = time.monotonic() + 0.5
         size = self._buffer.size()
         while time.monotonic() < deadline:
@@ -442,13 +628,13 @@ class BashHandle:
             return False
         return pending > 0
 
-    def _finalize(self, exit_code: int) -> None:
+    def _finalize(self, exit_code: int, output: str | None = None) -> None:
         with self._callback_lock:
             if self._done.is_set():
                 return
             self._result = BashResult(
                 exit_code=exit_code,
-                output=self._buffer.text(),
+                output=self._buffer.text() if output is None else output,
                 duration=time.monotonic() - self._started,
             )
             self._done.set()
@@ -463,6 +649,142 @@ class BashHandle:
                 self._callbacks.append(callback)
                 return
         callback()
+
+    def _note_result_consumed(self, awaiter: asyncio.Task[Any] | None = None) -> None:
+        """Record a result read that reaches the model: only reads during a live
+        cell count (a detached reader between turns must keep the notice — it is
+        the idle session's only wake-up), and an awaiting reader must be one the
+        live cell waits for."""
+        if not self._done.is_set():
+            return
+        owner = _live_cell_owner()
+        if owner is None:
+            return
+        if awaiter is not None and not _creating_cell_waits_for(owner, awaiter):
+            return
+        with self._callback_lock:
+            if self._result_consumed:
+                return
+            self._result_consumed = True
+            notice, self._consumed_notice = self._consumed_notice, None
+        if notice is not None:
+            notice()
+
+    def _schedule_background_completion_notice(self) -> None:
+        cell_finished = self._creating_cell_finished
+        if cell_finished is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        from . import repl
+
+        activity = {"id": secrets.token_hex(16), "pid": self._pid, "active": True}
+        # Publish synchronously before bash() returns and the creating cell can end.
+        repl.emit({"application/vnd.prime-agent.bash-activity+json": activity})
+        notice = self._notify_background_completion(cell_finished, activity)
+        try:
+            task = loop.create_task(notice)
+        except BaseException:
+            self.kill(signal.SIGKILL if _IS_POSIX else signal.SIGTERM)
+            notice.close()
+            repl.emit({"application/vnd.prime-agent.bash-activity+json": {**activity, "active": False}})
+            raise
+        task.add_done_callback(_consume_notice_task)
+
+    async def _notify_background_completion(
+        self, cell_finished: asyncio.Event, activity: dict[str, Any]
+    ) -> None:
+        from . import repl
+
+        try:
+            result = await self._wait()
+            await self._wait_reaped()
+            # The cell may do other work before awaiting this handle. Do not classify
+            # it as detached until that whole cell has crossed its completion barrier.
+            await cell_finished.wait()
+            if self._awaited_by_creating_cell or self._result_consumed or not repl.is_active():
+                return
+            command = self.command
+            if len(command) > _COMPLETION_NOTICE_COMMAND_CAP:
+                command = command[:_COMPLETION_NOTICE_COMMAND_CAP] + "\n... [command truncated]"
+            reply = await repl.host_request(
+                {
+                    "type": "bash.completed",
+                    "pid": self._pid,
+                    "command": command,
+                    "exitCode": result.exit_code,
+                }
+            )
+            if isinstance(reply, dict) and reply.get("status") == "ok":
+                # Notice accepted by the host; later reads must ask it to withdraw.
+                self._arm_consumed_notice(command)
+            else:
+                sys.stderr.write(
+                    f"Background bash completion follow-up for pid {self._pid} was not accepted. "
+                    "Inspect the saved handle with poll(), output(), or tail().\n"
+                )
+        except (OSError, RuntimeError):
+            # Standalone runtimes have no host handler, and teardown can close
+            # the bridge while a process is finishing. Shell results stay usable.
+            return
+        finally:
+            # Reap and deliver (or report rejection) before releasing kernel residency.
+            repl.emit({"application/vnd.prime-agent.bash-activity+json": {**activity, "active": False}})
+
+    def _arm_consumed_notice(self, command: str) -> None:
+        # Armed only post-acceptance: the withdrawal can never overtake its notice.
+        loop = asyncio.get_running_loop()
+
+        def dispatch() -> None:
+            def start() -> None:
+                task = loop.create_task(self._notify_result_consumed(command))
+                task.add_done_callback(_consume_notice_task)
+
+            try:
+                loop.call_soon_threadsafe(start)
+            except RuntimeError:
+                pass  # notifying loop already closed
+
+        with self._callback_lock:
+            if not self._result_consumed:
+                self._consumed_notice = dispatch
+                return
+        dispatch()
+
+    async def _notify_result_consumed(self, command: str) -> None:
+        from . import repl
+
+        if not repl.is_active():
+            return
+        try:
+            await repl.host_request(
+                {"type": "bash.consumed", "pid": self._pid, "command": command}
+            )
+        except (OSError, RuntimeError):
+            return  # bridge closed at teardown; old hosts error-reply — both fine
+
+    async def _wait_reaped(self) -> None:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[None] = loop.create_future()
+
+        def wake() -> None:
+            try:
+                loop.call_soon_threadsafe(lambda: future.done() or future.set_result(None))
+            except RuntimeError:
+                pass
+
+        with self._callback_lock:
+            if self._reaped:
+                return
+            self._reap_callback = wake
+        try:
+            await future
+        finally:
+            with self._callback_lock:
+                if self._reap_callback is wake:
+                    self._reap_callback = None
 
     async def _wait(self) -> BashResult:
         # Asyncio-native wakeup: no executor thread is parked for the command's
@@ -588,10 +910,27 @@ class BashHandle:
         # A handle awaited before any other API use is a one-shot command tied
         # to the await (kill-on-cancel); touching the handle API first marks it
         # as a deliberate background handle whose awaits only wait.
-        if self._released:
-            return self._wait().__await__()
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        creating_cell_waited = _creating_cell_waits_for(self._creating_cell_task, current_task)
+        owned = not self._released
+        wait = self._wait_owned() if owned else self._wait()
         self._released = True
-        return self._wait_owned().__await__()
+        completed = False
+        try:
+            result = yield from wait.__await__()
+            completed = True
+            return result
+        finally:
+            if (completed or owned) and (
+                creating_cell_waited
+                or _creating_cell_waits_for(self._creating_cell_task, current_task)
+            ):
+                self._awaited_by_creating_cell = True
+            if completed:
+                self._note_result_consumed(current_task)
 
     def __repr__(self) -> str:
         state = f"exit_code={self._result.exit_code}" if self._result else "running"
@@ -609,6 +948,9 @@ def bash(command: str) -> BashHandle:
     POSIX; a kill-on-close job object on Windows entered while the child is
     still suspended, so no descendant can escape it and kill()/crash cleanup
     are unconditional -- bash() raises if containment cannot be established.
+    Output written after the completion fence (e.g. by an EXIT trap or a
+    background job) is not in BashResult.output but stays visible via
+    handle.output()/tail().
     """
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")
@@ -642,24 +984,33 @@ def _with_prefix(command: str) -> str:
     return f"{prefix}\n{command}" if prefix else command
 
 
-def _status_script(command: str) -> str:
-    # The status socket arrives as stdin (fd 0); the prologue dups it to the
-    # single-digit _STATUS_FD (dash rejects multi-digit fds in redirections at
-    # parse time) and points stdin at /dev/null, so no other copy remains. The
-    # gate read blocks until the parent has journaled the pid; EOF (parent died
-    # first) exits without running the command. The brace group runs the command
-    # with the status fd closed so `&` children do not inherit it; the trailing
-    # `wait` keeps the shell alive as group leader until its own jobs exit
-    # (double-forked daemons stay out of scope).
+def _fence_printf() -> str:
+    # `\command -p printf` defeats alias expansion but not a user-defined shell
+    # function named `command`, which would swallow both fence frames and leave
+    # the await hanging until the shell dies (wedged behind background jobs). A
+    # slash-qualified command name bypasses function and alias lookup for
+    # ordinary command names, so resolve printf on the system default utility PATH.
+    path = shutil.which("printf", path=os.confstr("CS_PATH") or os.defpath)
+    if path and "'" not in path:
+        return f"'{path}'"
+    return "\\command -p printf"
+
+
+def _status_script(command: str, completion_a: str, completion_b: str) -> str:
+    # Closed control fds preserve background behavior; supported shells atomically write the frame.
+    emit = _fence_printf()
     return (
-        f"exec {_STATUS_FD}>&0 0</dev/null\n"
+        f"exec {_STATUS_FD}>&0 {_OUTPUT_FD}>&1 0</dev/null\n"
         f"read -r _prime_agent_gate <&{_STATUS_FD} || exit 127\n"
         "{\n"
         f"{command}\n"
-        f"}} {_STATUS_FD}>&-\n"
+        f"}} {_OUTPUT_FD}>&- {_STATUS_FD}>&-\n"
         "__prime_status=$?\n"
-        f"printf '%s\\n' \"$__prime_status\" >&{_STATUS_FD}\n"
-        f"exec {_STATUS_FD}>&-\n"
+        "\\set +x\n"
+        f"{emit} '\\036prime-agent-complete:%s%s\\037' "
+        f"'{completion_a}' '{completion_b}' >&{_OUTPUT_FD} || exit \"$__prime_status\"\n"
+        f"{emit} '%s\\n' \"$__prime_status\" >&{_STATUS_FD}\n"
+        f"exec {_OUTPUT_FD}>&- {_STATUS_FD}>&-\n"
         "wait\n"
         'exit "$__prime_status"\n'
     )
